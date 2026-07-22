@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 const API_BASE_URL = "https://api.asmr-200.com";
@@ -54,6 +54,7 @@ type DownloaderSettings = {
   maxWorkers: number;
   preferMedia: string;
   proxyUrl: string;
+  requestTimeoutMs: number;
 };
 
 type ArchiveEntry = {
@@ -735,6 +736,7 @@ async function readDownloaderSettings(workingDirectory: string, config: Config):
     maxWorkers: config.concurrency,
     preferMedia: "all",
     proxyUrl: "",
+    requestTimeoutMs: config.requestTimeoutMs,
   };
   const file = Bun.file(join(workingDirectory, ".asmroner-data", "config.toml"));
   if (!(await file.exists())) return settings;
@@ -752,38 +754,149 @@ async function downloadFile(
   file: DownloadFile,
   root: string,
   settings: DownloaderSettings,
-): Promise<void> {
+): Promise<"downloaded" | "skipped"> {
   const targetPath = join(root, file.relativePath);
   const partialPath = `${targetPath}.asmr-archive-checker-part`;
   await mkdir(dirname(targetPath), { recursive: true });
+  if (await pathExists(targetPath)) {
+    const existing = await stat(targetPath);
+    if (existing.isFile() && isCompleteDownloadFile(existing.size, file.size)) return "skipped";
+    if (!existing.isFile()) throw new Error(`${file.relativePath}：目标路径存在但不是文件`);
+  }
   let lastError: unknown;
   for (let attempt = 0; attempt <= settings.maxRetries; attempt += 1) {
+    const controller = new AbortController();
+    let requestTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       if (attempt > 0) {
         console.warn(`重试 ${attempt}/${settings.maxRetries}：${file.relativePath}（${errorMessage(lastError)}）`);
         await Bun.sleep(Math.min(500 * 2 ** (attempt - 1), 4_000));
       }
       await rm(partialPath, { force: true });
+      requestTimer = setTimeout(() => controller.abort(), settings.requestTimeoutMs);
       const response = await fetch(file.url, {
         headers: { "User-Agent": "asmr-archive-checker/1.0" },
+        signal: controller.signal,
         ...(settings.proxyUrl ? { proxy: settings.proxyUrl } : {}),
       });
+      clearTimeout(requestTimer);
+      requestTimer = undefined;
       if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-      await Bun.write(partialPath, response);
+      await writeResponseBodyToFile(
+        response,
+        partialPath,
+        controller,
+        settings.requestTimeoutMs,
+      );
       if (file.size !== undefined) {
         const downloaded = await stat(partialPath);
         if (downloaded.size !== file.size) {
           throw new Error(`文件大小不符：预期 ${file.size}，实际 ${downloaded.size}`);
         }
       }
+      // 只有新的临时文件完整落盘后，才替换旧的错误大小文件。
+      await rm(targetPath, { force: true });
       await rename(partialPath, targetPath);
-      return;
+      return "downloaded";
     } catch (error) {
       lastError = error;
+    } finally {
+      if (requestTimer !== undefined) clearTimeout(requestTimer);
+      controller.abort();
     }
   }
   await rm(partialPath, { force: true }).catch(() => undefined);
   throw new Error(`${file.relativePath}：${errorMessage(lastError)}`);
+}
+
+export async function writeResponseBodyToFile(
+  response: Response,
+  path: string,
+  controller: AbortController,
+  inactivityTimeoutMs: number,
+): Promise<void> {
+  if (!response.body) throw new Error("下载响应没有文件内容");
+  const reader = response.body.getReader();
+  const file = await open(path, "w");
+  let position = 0;
+  try {
+    while (true) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`连续 ${inactivityTimeoutMs} 毫秒没有收到下载数据`));
+        }, inactivityTimeoutMs);
+      });
+      const chunk = await (async () => {
+        try {
+          return await Promise.race([reader.read(), timeout]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      })();
+      if (chunk.done) break;
+
+      let offset = 0;
+      while (offset < chunk.value.byteLength) {
+        const written = await file.write(
+          chunk.value,
+          offset,
+          chunk.value.byteLength - offset,
+          position,
+        );
+        if (written.bytesWritten <= 0) throw new Error("无法继续写入下载文件");
+        offset += written.bytesWritten;
+        position += written.bytesWritten;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+    await file.close();
+  }
+}
+
+export function isCompleteDownloadFile(actualSize: number, expectedSize?: number): boolean {
+  return expectedSize === undefined || actualSize === expectedSize;
+}
+
+async function directorySize(root: string): Promise<number> {
+  let size = 0;
+  async function visit(directory: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile()) size += (await stat(path)).size;
+    }
+  }
+  await visit(root);
+  return size;
+}
+
+export async function prepareBuiltinStagingPath(stagingRoot: string, displayId: string): Promise<string> {
+  const stablePath = join(stagingRoot, displayId);
+  if (await pathExists(stablePath)) {
+    const existing = await stat(stablePath);
+    if (!existing.isDirectory()) throw new Error(`下载临时路径存在但不是文件夹：${stablePath}`);
+    return stablePath;
+  }
+
+  // 兼容旧版本创建的随机临时目录，优先复用已下载数据最多的一份。
+  const entries = await readdir(stagingRoot, { withFileTypes: true });
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(`${displayId}-`))
+    .map((entry) => join(stagingRoot, entry.name));
+  if (candidates.length > 0) {
+    const sizes = await Promise.all(candidates.map(async (path) => ({ path, size: await directorySize(path) })));
+    sizes.sort((a, b) => b.size - a.size);
+    await rename(sizes[0].path, stablePath);
+    console.log(`继续上次下载：${stablePath}`);
+    return stablePath;
+  }
+
+  await mkdir(stablePath);
+  return stablePath;
 }
 
 async function downloadWithBuiltin(workId: number, stagingPath: string, config: Config): Promise<void> {
@@ -801,11 +914,13 @@ async function downloadWithBuiltin(workId: number, stagingPath: string, config: 
 
   console.log(`Windows 内置下载器：${files.length} 个文件，并发 ${settings.maxWorkers}`);
   let finished = 0;
+  let reused = 0;
   const errors = await mapLimit(files, settings.maxWorkers, async (file) => {
     try {
-      await downloadFile(file, stagingPath, settings);
+      const status = await downloadFile(file, stagingPath, settings);
       finished += 1;
-      console.log(`[${finished}/${files.length}] ${file.relativePath}`);
+      if (status === "skipped") reused += 1;
+      console.log(`[${finished}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);
       return undefined;
     } catch (error) {
       return errorMessage(error);
@@ -813,6 +928,7 @@ async function downloadWithBuiltin(workId: number, stagingPath: string, config: 
   });
   const failures = errors.filter((error): error is string => typeof error === "string");
   if (failures.length > 0) throw new Error(`${failures.length} 个文件下载失败；首个错误：${failures[0]}`);
+  if (reused > 0) console.log(`复用了 ${reused} 个已下载文件`);
 }
 
 async function downloadWithAsmroner(displayId: string, stagingPath: string, config: Config): Promise<void> {
@@ -834,9 +950,12 @@ async function downloadWork(workId: number, config: Config): Promise<DownloadRes
   }
 
   const stagingRoot = join(config.downloadDir, ".asmr-archive-checker-downloads");
-  await mkdir(stagingRoot, { recursive: true });
-  const stagingPath = await mkdtemp(join(stagingRoot, `${displayId}-`));
+  let stagingPath = join(stagingRoot, displayId);
   try {
+    await mkdir(stagingRoot, { recursive: true });
+    stagingPath = process.platform === "win32"
+      ? await prepareBuiltinStagingPath(stagingRoot, displayId)
+      : await mkdtemp(join(stagingRoot, `${displayId}-`));
     console.log(`下载完整作品 ${displayId} ...`);
     if (process.platform === "win32") await downloadWithBuiltin(workId, stagingPath, config);
     else await downloadWithAsmroner(displayId, stagingPath, config);
@@ -866,9 +985,38 @@ async function downloadWork(workId: number, config: Config): Promise<DownloadRes
 }
 
 async function downloadWorks(workIds: number[], config: Config): Promise<DownloadResult[]> {
-  const uniqueIds = [...new Set(workIds)].sort((a, b) => a - b);
+  const uniqueIds = [...new Set(workIds)];
   const results: DownloadResult[] = [];
-  for (const workId of uniqueIds) results.push(await downloadWork(workId, config));
+  for (const [index, workId] of uniqueIds.entries()) {
+    console.log(`\n[作品 ${index + 1}/${uniqueIds.length}] ${displayWorkId(workId)}`);
+    const result = await downloadWork(workId, config);
+    results.push(result);
+    if (result.status === "downloaded") console.log(`作品完成：${result.displayId}`);
+    else if (result.status === "skipped") console.log(`作品已存在，跳过：${result.displayId}`);
+    else {
+      console.error(`作品失败：${result.displayId}：${result.error}`);
+      if (result.stagingPath) console.error(`可续传临时目录：${result.stagingPath}`);
+    }
+  }
+
+  const failedIndexes = results
+    .map((result, index) => result.status === "failed" ? index : -1)
+    .filter((index) => index >= 0);
+  if (failedIndexes.length > 0) {
+    console.log(`\n首轮有 ${failedIndexes.length} 部作品失败，开始续传重试。`);
+    for (const [retryIndex, resultIndex] of failedIndexes.entries()) {
+      const workId = uniqueIds[resultIndex];
+      console.log(`\n[重试 ${retryIndex + 1}/${failedIndexes.length}] ${displayWorkId(workId)}`);
+      const result = await downloadWork(workId, config);
+      results[resultIndex] = result;
+      if (result.status === "downloaded") console.log(`重试完成：${result.displayId}`);
+      else if (result.status === "skipped") console.log(`作品已存在，跳过：${result.displayId}`);
+      else {
+        console.error(`重试失败：${result.displayId}：${result.error}`);
+        if (result.stagingPath) console.error(`可续传临时目录：${result.stagingPath}`);
+      }
+    }
+  }
   return results;
 }
 

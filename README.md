@@ -14,7 +14,7 @@
 - 7-Zip，命令行可运行 `7z`；
 - [asmr-downloader](https://github.com/fireinrain/asmr-downloader/releases)，命令行可运行 `asmroner`，并且已执行 `asmroner config` 完成初始化。
 
-Windows 下的 `asmroner v2.0.6` 会错误清洗完整绝对路径和作品文件名：前者会生成 `C_` 文件夹，后者遇到 `?` 等字符会下载失败。因此 Windows 下载模式直接使用网站文件列表下载，并安全清洗文件名；它仍读取项目下 `.asmroner-data/config.toml` 中的 `proxy_url`、`prefer_media`、`max_retries` 和 `max_workers`。其他平台继续调用 `asmroner`。每次下载的都是整部作品，不会只补缺失文件。
+Windows 下的 `asmroner v2.0.6` 会错误清洗完整绝对路径和作品文件名：前者会生成 `C_` 文件夹，后者遇到 `?` 等字符会下载失败。因此 Windows 下载模式直接使用网站文件列表下载，并安全清洗文件名；文件响应会以分块流方式直接写入磁盘，避免并发下载大文件时占用过多内存。它仍读取项目下 `.asmroner-data/config.toml` 中的 `proxy_url`、`prefer_media`、`max_retries` 和 `max_workers`。其他平台继续调用 `asmroner`。每次下载的都是整部作品，不会只补缺失文件。
 
 ## 配置
 
@@ -100,7 +100,7 @@ bun run archives -- --dir "D:\音声\待检查" --output "D:\检查结果"
 - 待下载汇总会把遗漏作品和不完整作品按编号去重；
 - `download` 模式逐行读取汇总，下载完整作品；
 - 下载先进入 `downloadDir/.asmr-archive-checker-downloads` 下的临时目录，成功后移动并改名为八位 RJ 编号；Windows 非法文件名字符会替换为 `_`；
-- 标准名称的目标文件夹已经存在时会跳过，不覆盖已有文件；失败时保留临时目录以便检查。
+- 标准名称的目标文件夹已经存在时会跳过，不覆盖已有文件；失败时保留每部作品固定的临时目录，再次运行会校验文件大小并续传尚未完成的文件。旧版本生成的随机临时目录也会自动选择数据最多的一份继续下载。
 
 无法从文件名识别 RJ 编号的 7z 无法自动检查或加入下载汇总，程序会在命令行提示数量。
 
