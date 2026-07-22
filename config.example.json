@@ -1,0 +1,10 @@
+{
+  "author": "作者名",
+  "archiveDir": "D:/path/to/archives",
+  "downloadDir": "D:/path/to/downloads",
+  "outputDir": "./output",
+  "sevenZipPath": "7z",
+  "downloaderPath": "asmroner",
+  "concurrency": 4,
+  "requestTimeoutMs": 30000
+}

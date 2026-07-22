@@ -1,0 +1,12 @@
+{
+  "name": "asmr-archive-checker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "bun run src/index.ts",
+    "author": "bun run src/index.ts author",
+    "archives": "bun run src/index.ts archives",
+    "download": "bun run src/index.ts download",
+    "test": "bun test"
+  }
+}

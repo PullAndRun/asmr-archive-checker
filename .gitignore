@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Local configuration and environment variables
+config.json
+.env
+.env.*
+!.env.example
+
+# Generated output and runtime data
+output/
+.asmroner-data/
+*.log
+*.7z
+
+# Local agent and editor files
+.agents/
+.codex/
+.idea/
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
