@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+.bun-cache/
+bun.lock
 
 # Local configuration and environment variables
 config.json
@@ -10,6 +12,7 @@ config.json
 # Generated output and runtime data
 output/
 .asmroner-data/
+.asmr-archive-checker-target-*
 *.log
 *.7z
 

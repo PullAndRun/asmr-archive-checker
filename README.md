@@ -14,7 +14,7 @@
 - 7-Zip，命令行可运行 `7z`；
 - [asmr-downloader](https://github.com/fireinrain/asmr-downloader/releases)，命令行可运行 `asmroner`，并且已执行 `asmroner config` 完成初始化。
 
-`asmroner` 的媒体格式、代理、限流等行为沿用它自己的配置。下载模式调用 `asmroner download RJxxxxxxxx -d <临时目录>`，每次下载整部作品，不会只补缺失文件。
+`asmroner` 的媒体格式、代理、限流等行为沿用它自己的配置。下载模式会在 `downloadDir` 下的临时目录中调用 `asmroner`，每次下载整部作品，不会只补缺失文件。程序只会向 `asmroner -d` 传入不含 Windows 盘符的相对路径，避免它把绝对路径写成项目根目录下的 `C_`。
 
 ## 配置
 

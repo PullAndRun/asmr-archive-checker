@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { isAbsolute, resolve } from "node:path";
 import {
+  buildDownloaderInvocation,
   buildSearchUrl,
   buildWorkSearchUrl,
   findMissingFiles,
@@ -10,6 +12,19 @@ import {
   parseSevenZipListing,
   workIdFromArchiveName,
 } from "../src/index.ts";
+
+describe("下载器调用", () => {
+  test("不将 Windows 绝对路径作为 -d 参数传给 asmroner", () => {
+    const workingDirectory = resolve("test-project");
+    const stagingPath = resolve(workingDirectory, "download", ".staging", "RJ01602072-test");
+    const invocation = buildDownloaderInvocation("asmroner", "RJ01602072", stagingPath, workingDirectory);
+
+    expect(invocation.cwd).toBe(workingDirectory);
+    expect(invocation.command.slice(0, 4)).toEqual(["asmroner", "download", "RJ01602072", "-d"]);
+    expect(isAbsolute(invocation.command[4])).toBe(false);
+    expect(resolve(invocation.cwd, invocation.command[4])).toBe(stagingPath);
+  });
+});
 
 describe("编号识别", () => {
   test("兼容有无前导零的 RJ 编号", () => {

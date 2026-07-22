@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readdir, rename, rm, rmdir, stat, symlink, unlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 const API_BASE_URL = "https://api.asmr-200.com";
@@ -408,6 +409,9 @@ async function listArchive(path: string, sevenZipPath: string): Promise<ArchiveE
   } catch (error) {
     throw new Error(`无法启动 7-Zip（${sevenZipPath}）：${errorMessage(error)}`);
   }
+  if (!(process.stdout instanceof ReadableStream) || !(process.stderr instanceof ReadableStream)) {
+    throw new Error("7-Zip 子进程未提供可读的输出流");
+  }
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(process.stdout).text(),
     new Response(process.stderr).text(),
@@ -609,6 +613,35 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+export function buildDownloaderInvocation(
+  downloaderPath: string,
+  displayId: string,
+  stagingPath: string,
+  workingDirectory = resolve("."),
+): { command: string[]; cwd: string } {
+  const downloadPath = relative(workingDirectory, stagingPath);
+  if (!downloadPath || isAbsolute(downloadPath)) {
+    throw new Error(`无法生成下载临时目录的相对路径：${stagingPath}`);
+  }
+  return {
+    command: [downloaderPath, "download", displayId, "-d", downloadPath],
+    cwd: workingDirectory,
+  };
+}
+
+async function prepareDownloaderTarget(
+  stagingPath: string,
+  workingDirectory: string,
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  if (containsPath(workingDirectory, stagingPath)) {
+    return { path: stagingPath, cleanup: async () => undefined };
+  }
+
+  const linkPath = join(workingDirectory, `.asmr-archive-checker-target-${randomUUID()}`);
+  await symlink(stagingPath, linkPath, process.platform === "win32" ? "junction" : "dir");
+  return { path: linkPath, cleanup: async () => unlink(linkPath) };
+}
+
 async function downloadWork(workId: number, config: Config): Promise<DownloadResult> {
   const displayId = displayWorkId(workId);
   const targetPath = join(config.downloadDir, displayId);
@@ -623,11 +656,30 @@ async function downloadWork(workId: number, config: Config): Promise<DownloadRes
   const stagingPath = await mkdtemp(join(stagingRoot, `${displayId}-`));
   try {
     console.log(`下载完整作品 ${displayId} ...`);
-    const child = Bun.spawn(
-      [config.downloaderPath, "download", displayId, "-d", stagingPath],
-      { stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true },
+    const workingDirectory = resolve(".");
+    const downloaderTarget = await prepareDownloaderTarget(stagingPath, workingDirectory);
+    const invocation = buildDownloaderInvocation(
+      config.downloaderPath,
+      displayId,
+      downloaderTarget.path,
+      workingDirectory,
     );
-    const exitCode = await child.exited;
+    let exitCode: number;
+    try {
+      const child = Bun.spawn(
+        invocation.command,
+        {
+          cwd: invocation.cwd,
+          stdin: "inherit",
+          stdout: "inherit",
+          stderr: "inherit",
+          windowsHide: true,
+        },
+      );
+      exitCode = await child.exited;
+    } finally {
+      await downloaderTarget.cleanup();
+    }
     if (exitCode !== 0) throw new Error(`asmroner 返回代码 ${exitCode}`);
 
     const entries = await readdir(stagingPath, { withFileTypes: true });
