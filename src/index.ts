@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, rename, rm, rmdir, stat, symlink, unlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 const API_BASE_URL = "https://api.asmr-200.com";
@@ -40,6 +39,21 @@ type TrackNode = {
   type?: string;
   title?: string;
   children?: TrackNode[];
+  mediaDownloadUrl?: string;
+  size?: number;
+};
+
+type DownloadFile = {
+  url: string;
+  relativePath: string;
+  size?: number;
+};
+
+type DownloaderSettings = {
+  maxRetries: number;
+  maxWorkers: number;
+  preferMedia: string;
+  proxyUrl: string;
 };
 
 type ArchiveEntry = {
@@ -299,7 +313,7 @@ export function buildWorkSearchUrl(id: number): string {
   return url.toString();
 }
 
-async function fetchJson<T>(url: string, timeoutMs: number, attempts = 4): Promise<T> {
+async function fetchJson<T>(url: string, timeoutMs: number, attempts = 4, proxyUrl = ""): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const controller = new AbortController();
@@ -308,6 +322,7 @@ async function fetchJson<T>(url: string, timeoutMs: number, attempts = 4): Promi
       const response = await fetch(url, {
         headers: { Accept: "application/json", "User-Agent": "asmr-archive-checker/1.0" },
         signal: controller.signal,
+        ...(proxyUrl ? { proxy: proxyUrl } : {}),
       });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -476,7 +491,91 @@ function normalizePath(path: string): string {
 }
 
 function comparisonKey(path: string): string {
-  return normalizePath(path).toLowerCase();
+  return normalizePath(path)
+    .split("/")
+    .map(sanitizeDownloadPathSegment)
+    .join("/")
+    .toLowerCase();
+}
+
+export function sanitizeDownloadPathSegment(value: string): string {
+  let sanitized = value
+    .normalize("NFC")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/[ .]+$/g, "");
+  if (!sanitized || sanitized === "." || sanitized === "..") sanitized = "_";
+
+  const stem = sanitized.split(".", 1)[0];
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) sanitized = `_${sanitized}`;
+
+  const runes = [...sanitized];
+  if (runes.length > 180) {
+    const extension = extname(sanitized);
+    const extensionRunes = [...extension];
+    const keep = Math.max(1, 180 - extensionRunes.length);
+    sanitized = `${runes.slice(0, keep).join("")}${extension}`;
+  }
+  return sanitized;
+}
+
+function addCollisionSuffix(path: string, sequence: number): string {
+  const directory = dirname(path);
+  const extension = extname(path);
+  const name = basename(path, extension);
+  const suffixed = `${name} (${sequence})${extension}`;
+  return directory === "." ? suffixed : join(directory, suffixed);
+}
+
+export function buildDownloadFilePlan(nodes: TrackNode[], preferMedia = "all"): DownloadFile[] {
+  const files: DownloadFile[] = [];
+  function visit(items: TrackNode[], parents: string[]): void {
+    for (const item of items) {
+      const title = typeof item.title === "string" ? item.title : "";
+      if (Array.isArray(item.children)) {
+        visit(item.children, title ? [...parents, sanitizeDownloadPathSegment(title)] : parents);
+      } else if (title && typeof item.mediaDownloadUrl === "string" && item.mediaDownloadUrl) {
+        files.push({
+          url: item.mediaDownloadUrl,
+          relativePath: join(...parents, sanitizeDownloadPathSegment(title)),
+          ...(Number.isFinite(item.size) && item.size! >= 0 ? { size: item.size } : {}),
+        });
+      }
+    }
+  }
+  visit(nodes, []);
+
+  const preference = preferMedia.toLowerCase().split(">").map((item) => item.trim());
+  const audioExtensions = new Set([".mp3", ".wav", ".flac", ".mp3.vtt", ".wav.vtt", ".flac.vtt"]);
+  const extensionOf = (path: string): string => {
+    const lower = path.toLowerCase();
+    return [...audioExtensions].find((extension) => lower.endsWith(extension)) ?? extname(lower);
+  };
+  let selected = files;
+  if (!preference.includes("all")) {
+    const nonAudio = files.filter((file) => !audioExtensions.has(extensionOf(file.relativePath)));
+    for (const format of preference) {
+      const audio = files.filter((file) => {
+        const extension = extensionOf(file.relativePath);
+        return extension === `.${format}` || extension === `.${format}.vtt`;
+      });
+      if (audio.length > 0) {
+        selected = [...audio, ...nonAudio];
+        break;
+      }
+    }
+  }
+
+  const used = new Set<string>();
+  return selected.map((file) => {
+    let relativePath = file.relativePath;
+    let sequence = 2;
+    while (used.has(relativePath.toLowerCase())) {
+      relativePath = addCollisionSuffix(file.relativePath, sequence);
+      sequence += 1;
+    }
+    used.add(relativePath.toLowerCase());
+    return { ...file, relativePath };
+  });
 }
 
 function stripWorkRoot(path: string, workId: number): string {
@@ -613,33 +712,116 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-export function buildDownloaderInvocation(
-  downloaderPath: string,
-  displayId: string,
-  stagingPath: string,
-  workingDirectory = resolve("."),
-): { command: string[]; cwd: string } {
-  const downloadPath = relative(workingDirectory, stagingPath);
-  if (!downloadPath || isAbsolute(downloadPath)) {
-    throw new Error(`无法生成下载临时目录的相对路径：${stagingPath}`);
+function parseTomlValue(text: string, section: string, key: string): string | undefined {
+  let currentSection = "";
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/\s+#.*$/, "").trim();
+    const sectionMatch = line.match(/^\[([^\]]+)]$/);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1];
+      continue;
+    }
+    if (currentSection !== section) continue;
+    const valueMatch = line.match(new RegExp(`^${key}\\s*=\\s*(.+)$`));
+    if (!valueMatch) continue;
+    return valueMatch[1].trim().replace(/^(['"])(.*)\1$/, "$2");
   }
-  return {
-    command: [downloaderPath, "download", displayId, "-d", downloadPath],
-    cwd: workingDirectory,
-  };
+  return undefined;
 }
 
-async function prepareDownloaderTarget(
-  stagingPath: string,
-  workingDirectory: string,
-): Promise<{ path: string; cleanup: () => Promise<void> }> {
-  if (containsPath(workingDirectory, stagingPath)) {
-    return { path: stagingPath, cleanup: async () => undefined };
-  }
+async function readDownloaderSettings(workingDirectory: string, config: Config): Promise<DownloaderSettings> {
+  const settings: DownloaderSettings = {
+    maxRetries: 3,
+    maxWorkers: config.concurrency,
+    preferMedia: "all",
+    proxyUrl: "",
+  };
+  const file = Bun.file(join(workingDirectory, ".asmroner-data", "config.toml"));
+  if (!(await file.exists())) return settings;
+  const text = await file.text();
+  const maxRetries = Number.parseInt(parseTomlValue(text, "downloader", "max_retries") ?? "", 10);
+  const maxWorkers = Number.parseInt(parseTomlValue(text, "downloader", "max_workers") ?? "", 10);
+  if (Number.isInteger(maxRetries) && maxRetries >= 0) settings.maxRetries = maxRetries;
+  if (Number.isInteger(maxWorkers) && maxWorkers > 0) settings.maxWorkers = Math.min(maxWorkers, 20);
+  settings.preferMedia = parseTomlValue(text, "downloader", "prefer_media") || settings.preferMedia;
+  settings.proxyUrl = parseTomlValue(text, "downloader", "proxy_url") || "";
+  return settings;
+}
 
-  const linkPath = join(workingDirectory, `.asmr-archive-checker-target-${randomUUID()}`);
-  await symlink(stagingPath, linkPath, process.platform === "win32" ? "junction" : "dir");
-  return { path: linkPath, cleanup: async () => unlink(linkPath) };
+async function downloadFile(
+  file: DownloadFile,
+  root: string,
+  settings: DownloaderSettings,
+): Promise<void> {
+  const targetPath = join(root, file.relativePath);
+  const partialPath = `${targetPath}.asmr-archive-checker-part`;
+  await mkdir(dirname(targetPath), { recursive: true });
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= settings.maxRetries; attempt += 1) {
+    try {
+      if (attempt > 0) {
+        console.warn(`重试 ${attempt}/${settings.maxRetries}：${file.relativePath}（${errorMessage(lastError)}）`);
+        await Bun.sleep(Math.min(500 * 2 ** (attempt - 1), 4_000));
+      }
+      await rm(partialPath, { force: true });
+      const response = await fetch(file.url, {
+        headers: { "User-Agent": "asmr-archive-checker/1.0" },
+        ...(settings.proxyUrl ? { proxy: settings.proxyUrl } : {}),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      await Bun.write(partialPath, response);
+      if (file.size !== undefined) {
+        const downloaded = await stat(partialPath);
+        if (downloaded.size !== file.size) {
+          throw new Error(`文件大小不符：预期 ${file.size}，实际 ${downloaded.size}`);
+        }
+      }
+      await rename(partialPath, targetPath);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  await rm(partialPath, { force: true }).catch(() => undefined);
+  throw new Error(`${file.relativePath}：${errorMessage(lastError)}`);
+}
+
+async function downloadWithBuiltin(workId: number, stagingPath: string, config: Config): Promise<void> {
+  const workingDirectory = resolve(".");
+  const settings = await readDownloaderSettings(workingDirectory, config);
+  const trackTree = await fetchJson<TrackNode[]>(
+    `${API_BASE_URL}/api/tracks/${workId}?v=2`,
+    config.requestTimeoutMs,
+    4,
+    settings.proxyUrl,
+  );
+  if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
+  const files = buildDownloadFilePlan(trackTree, settings.preferMedia);
+  if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
+
+  console.log(`Windows 内置下载器：${files.length} 个文件，并发 ${settings.maxWorkers}`);
+  let finished = 0;
+  const errors = await mapLimit(files, settings.maxWorkers, async (file) => {
+    try {
+      await downloadFile(file, stagingPath, settings);
+      finished += 1;
+      console.log(`[${finished}/${files.length}] ${file.relativePath}`);
+      return undefined;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  });
+  const failures = errors.filter((error): error is string => typeof error === "string");
+  if (failures.length > 0) throw new Error(`${failures.length} 个文件下载失败；首个错误：${failures[0]}`);
+}
+
+async function downloadWithAsmroner(displayId: string, stagingPath: string, config: Config): Promise<void> {
+  const child = Bun.spawn(
+    [config.downloaderPath, "download", displayId, "-d", stagingPath],
+    { stdin: "inherit", stdout: "inherit", stderr: "inherit", windowsHide: true },
+  );
+  const exitCode = await child.exited;
+  if (exitCode !== 0) throw new Error(`asmroner 返回代码 ${exitCode}`);
 }
 
 async function downloadWork(workId: number, config: Config): Promise<DownloadResult> {
@@ -656,40 +838,21 @@ async function downloadWork(workId: number, config: Config): Promise<DownloadRes
   const stagingPath = await mkdtemp(join(stagingRoot, `${displayId}-`));
   try {
     console.log(`下载完整作品 ${displayId} ...`);
-    const workingDirectory = resolve(".");
-    const downloaderTarget = await prepareDownloaderTarget(stagingPath, workingDirectory);
-    const invocation = buildDownloaderInvocation(
-      config.downloaderPath,
-      displayId,
-      downloaderTarget.path,
-      workingDirectory,
-    );
-    let exitCode: number;
-    try {
-      const child = Bun.spawn(
-        invocation.command,
-        {
-          cwd: invocation.cwd,
-          stdin: "inherit",
-          stdout: "inherit",
-          stderr: "inherit",
-          windowsHide: true,
-        },
-      );
-      exitCode = await child.exited;
-    } finally {
-      await downloaderTarget.cleanup();
-    }
-    if (exitCode !== 0) throw new Error(`asmroner 返回代码 ${exitCode}`);
+    if (process.platform === "win32") await downloadWithBuiltin(workId, stagingPath, config);
+    else await downloadWithAsmroner(displayId, stagingPath, config);
 
-    const entries = await readdir(stagingPath, { withFileTypes: true });
-    const folders = entries.filter((entry) => entry.isDirectory());
-    if (folders.length !== 1) {
-      throw new Error(`下载目录中应有 1 个作品文件夹，实际为 ${folders.length} 个`);
-    }
     if (await pathExists(targetPath)) throw new Error(`目标文件夹已存在：${targetPath}`);
-    await rename(join(stagingPath, folders[0].name), targetPath);
-    await rmdir(stagingPath).catch(() => undefined);
+    if (process.platform === "win32") {
+      await rename(stagingPath, targetPath);
+    } else {
+      const entries = await readdir(stagingPath, { withFileTypes: true });
+      const folders = entries.filter((entry) => entry.isDirectory());
+      if (folders.length !== 1) {
+        throw new Error(`下载目录中应有 1 个作品文件夹，实际为 ${folders.length} 个`);
+      }
+      await rename(join(stagingPath, folders[0].name), targetPath);
+      await rmdir(stagingPath).catch(() => undefined);
+    }
     return { workId, displayId, status: "downloaded", targetPath };
   } catch (error) {
     return {

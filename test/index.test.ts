@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { isAbsolute, resolve } from "node:path";
 import {
-  buildDownloaderInvocation,
+  buildDownloadFilePlan,
   buildSearchUrl,
   buildWorkSearchUrl,
   findMissingFiles,
@@ -10,19 +9,40 @@ import {
   parseArgs,
   parseDownloadQueue,
   parseSevenZipListing,
+  sanitizeDownloadPathSegment,
   workIdFromArchiveName,
 } from "../src/index.ts";
 
 describe("下载器调用", () => {
-  test("不将 Windows 绝对路径作为 -d 参数传给 asmroner", () => {
-    const workingDirectory = resolve("test-project");
-    const stagingPath = resolve(workingDirectory, "download", ".staging", "RJ01602072-test");
-    const invocation = buildDownloaderInvocation("asmroner", "RJ01602072", stagingPath, workingDirectory);
+  test("清理 Windows 非法文件名和保留扩展名", () => {
+    expect(sanitizeDownloadPathSegment("04_リベンジ成功…?.wav")).toBe("04_リベンジ成功…_.wav");
+    expect(sanitizeDownloadPathSegment("CON.txt")).toBe("_CON.txt");
+    expect(sanitizeDownloadPathSegment("结尾. ")).toBe("结尾");
+  });
 
-    expect(invocation.cwd).toBe(workingDirectory);
-    expect(invocation.command.slice(0, 4)).toEqual(["asmroner", "download", "RJ01602072", "-d"]);
-    expect(isAbsolute(invocation.command[4])).toBe(false);
-    expect(resolve(invocation.cwd, invocation.command[4])).toBe(stagingPath);
+  test("生成安全且不冲突的下载路径", () => {
+    expect(buildDownloadFilePlan([
+      {
+        type: "folder",
+        title: "文本:目录",
+        children: [
+          { type: "text", title: "问题?.txt", mediaDownloadUrl: "https://example.com/1" },
+          { type: "text", title: "问题*.txt", mediaDownloadUrl: "https://example.com/2" },
+        ],
+      },
+    ])).toEqual([
+      { url: "https://example.com/1", relativePath: "文本_目录\\问题_.txt" },
+      { url: "https://example.com/2", relativePath: "文本_目录\\问题_ (2).txt" },
+    ]);
+  });
+
+  test("遵循 asmroner 的媒体格式偏好并保留非音频文件", () => {
+    const files = buildDownloadFilePlan([
+      { type: "audio", title: "声音.wav", mediaDownloadUrl: "https://example.com/wav" },
+      { type: "audio", title: "声音.mp3", mediaDownloadUrl: "https://example.com/mp3" },
+      { type: "image", title: "封面.jpg", mediaDownloadUrl: "https://example.com/jpg" },
+    ], "mp3>wav>flac");
+    expect(files.map((file) => file.relativePath)).toEqual(["声音.mp3", "封面.jpg"]);
   });
 });
 
