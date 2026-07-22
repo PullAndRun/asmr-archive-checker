@@ -2,6 +2,7 @@
   "name": "asmr-archive-checker",
   "private": true,
   "type": "module",
+  "license": "WTFPL",
   "scripts": {
     "check": "bun run src/index.ts",
     "author": "bun run src/index.ts author",
