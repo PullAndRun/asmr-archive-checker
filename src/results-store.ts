@@ -19,6 +19,7 @@ import {
 } from "./domain/records.ts";
 import { workCodeFromMetadata, workCodeOf } from "./domain/work-code.ts";
 import { errorMessage } from "./shared.ts";
+import { logger } from "./logger.ts";
 import type { Config, SearchWork } from "./types.ts";
 
 export async function readDeletionQueue(outputDir: string): Promise<IncompleteArchive[]> {
@@ -89,7 +90,11 @@ export async function replaceOutputDirectory(
       }
       throw error;
     }
-    if (hasBackup) await rm(backupDir, { recursive: true, force: true });
+    if (hasBackup) {
+      await rm(backupDir, { recursive: true, force: true }).catch((error) => {
+        logger.warn(`结果目录已更新，但无法清理旧结果 ${backupDir}：${errorMessage(error)}`);
+      });
+    }
   } finally {
     await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
   }

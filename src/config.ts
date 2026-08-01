@@ -12,6 +12,7 @@ const DEFAULT_CONFIG: Config = {
   sevenZipPath: "7z",
   concurrency: 4,
   requestTimeoutMs: 30_000,
+  archiveTimeoutMs: 300_000,
   maxDownloadSize: "",
 };
 
@@ -125,6 +126,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
   if (typeof merged.sevenZipPath !== "string" || !merged.sevenZipPath.trim()) throw new Error("sevenZipPath 必须是非空命令或路径");
   if (!Number.isInteger(merged.concurrency) || merged.concurrency < 1 || merged.concurrency > 20) throw new Error("concurrency 必须是 1 到 20 之间的整数");
   if (!Number.isFinite(merged.requestTimeoutMs) || merged.requestTimeoutMs < 1_000) throw new Error("requestTimeoutMs 必须不少于 1000 毫秒");
+  if (!Number.isFinite(merged.archiveTimeoutMs) || merged.archiveTimeoutMs! < 1_000) throw new Error("archiveTimeoutMs 必须不少于 1000 毫秒");
   if (typeof merged.maxDownloadSize !== "string") throw new Error("maxDownloadSize 必须是带单位的体积字符串或空字符串");
 
   return {

@@ -1,12 +1,12 @@
-import { mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstat, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import { API_BASE_URL } from "./constants.ts";
 import { fetchJson, fetchWorkByCode, workCodeFromSearchWork } from "./api.ts";
 import { buildDownloadFilePlan, type DownloadFile, type TrackNode } from "./domain/archive.ts";
 import { formatFileSize, hasReachedDownloadSizeLimit } from "./domain/size.ts";
 import { formatWorkId } from "./domain/work-code.ts";
 import { directorySize, pathExists } from "./fs-utils.ts";
-import { errorMessage, mapLimit } from "./shared.ts";
+import { containsPath, errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type {
   Config,
@@ -49,15 +49,39 @@ export async function readDownloaderSettings(workingDirectory: string, config: C
   const syncQps = Number.parseFloat(parseTomlValue(text, "limit", "sync_qps") ?? "");
   return {
     ...defaults,
-    ...(Number.isInteger(maxRetries) && maxRetries >= 0 ? { maxRetries } : {}),
+    ...(Number.isInteger(maxRetries) && maxRetries >= 0 ? { maxRetries: Math.min(maxRetries, 20) } : {}),
     ...(Number.isInteger(maxWorkers) && maxWorkers > 0 ? { maxWorkers: Math.min(maxWorkers, 20) } : {}),
     proxyUrl: parseTomlValue(text, "downloader", "proxy_url") || "",
-    ...(Number.isFinite(syncQps) && syncQps > 0 ? { syncQps } : {}),
+    ...(Number.isFinite(syncQps) && syncQps > 0 ? { syncQps: Math.min(syncQps, 100) } : {}),
   };
 }
 
 export function isCompleteDownloadFile(actualSize: number, expectedSize?: number): boolean {
   return expectedSize === undefined || actualSize === expectedSize;
+}
+
+export async function ensureSafeDownloadDirectory(root: string, directory: string): Promise<void> {
+  const resolvedRoot = resolve(root);
+  const resolvedDirectory = resolve(directory);
+  if (!containsPath(resolvedRoot, resolvedDirectory)) throw new Error("下载路径越过了临时目录");
+
+  const rootInfo = await lstat(resolvedRoot);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error(`下载临时路径不是普通文件夹：${resolvedRoot}`);
+
+  let current = resolvedRoot;
+  const relation = relative(resolvedRoot, resolvedDirectory);
+  for (const segment of relation.split(/[\\/]+/).filter(Boolean)) {
+    current = join(current, segment);
+    try {
+      await mkdir(current);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    }
+    const info = await lstat(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`下载路径包含链接或非文件夹组件：${current}`);
+    }
+  }
 }
 
 export async function writeResponseBodyToFile(
@@ -70,7 +94,8 @@ export async function writeResponseBodyToFile(
   if (!Number.isFinite(inactivityTimeoutMs) || inactivityTimeoutMs <= 0) {
     throw new Error(`下载无数据超时必须是正数，实际为 ${inactivityTimeoutMs}`);
   }
-  const file = await open(path, "w");
+  // Exclusive creation prevents a concurrently inserted symlink from being followed.
+  const file = await open(path, "wx", 0o600);
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let position = 0;
   let completed = false;
@@ -109,11 +134,21 @@ export async function writeResponseBodyToFile(
 }
 
 const downloadFile = async (file: DownloadFile, root: string, settings: DownloaderSettings): Promise<"downloaded" | "skipped"> => {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(file.url);
+  } catch {
+    throw new Error(`${file.relativePath}：下载地址无效`);
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new Error(`${file.relativePath}：只允许 HTTP 或 HTTPS 下载地址`);
+  }
   const targetPath = join(root, file.relativePath);
   const partialPath = `${targetPath}.asmr-archive-checker-part`;
-  await mkdir(dirname(targetPath), { recursive: true });
+  await ensureSafeDownloadDirectory(root, dirname(targetPath));
   if (await pathExists(targetPath)) {
-    const existing = await stat(targetPath);
+    const existing = await lstat(targetPath);
+    if (existing.isSymbolicLink()) throw new Error(`${file.relativePath}：目标路径是符号链接`);
     if (existing.isFile() && isCompleteDownloadFile(existing.size, file.size)) return "skipped";
     if (!existing.isFile()) throw new Error(`${file.relativePath}：目标路径存在但不是文件`);
   }
@@ -136,11 +171,20 @@ const downloadFile = async (file: DownloadFile, root: string, settings: Download
       clearTimeout(timer);
       timer = undefined;
       if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      const lengthHeader = response.headers.has("content-encoding") ? null : response.headers.get("content-length");
+      const responseSize = lengthHeader && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : undefined;
+      if (responseSize !== undefined && (!Number.isSafeInteger(responseSize) || responseSize < 0)) {
+        throw new Error(`响应文件大小无效：${lengthHeader}`);
+      }
+      if (file.size !== undefined && responseSize !== undefined && file.size !== responseSize) {
+        throw new Error(`响应文件大小不符：预期 ${file.size}，响应声明 ${responseSize}`);
+      }
       await writeResponseBodyToFile(response, partialPath, controller, settings.requestTimeoutMs);
-      if (file.size !== undefined) {
+      const expectedSize = file.size ?? responseSize;
+      if (expectedSize !== undefined) {
         const actualSize = (await stat(partialPath)).size;
-        if (actualSize !== file.size) {
-          throw new Error(`文件大小不符：预期 ${file.size}，实际 ${actualSize}`);
+        if (actualSize !== expectedSize) {
+          throw new Error(`文件大小不符：预期 ${expectedSize}，实际 ${actualSize}`);
         }
       }
       await rm(targetPath, { force: true });
@@ -160,7 +204,8 @@ const downloadFile = async (file: DownloadFile, root: string, settings: Download
 export async function prepareStagingPath(stagingRoot: string, displayId: string): Promise<string> {
   const stablePath = join(stagingRoot, displayId);
   if (await pathExists(stablePath)) {
-    if (!(await stat(stablePath)).isDirectory()) throw new Error(`下载临时路径存在但不是文件夹：${stablePath}`);
+    const info = await lstat(stablePath);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`下载临时路径存在但不是普通文件夹：${stablePath}`);
     return stablePath;
   }
   const candidates = (await readdir(stagingRoot, { withFileTypes: true }))
@@ -217,7 +262,11 @@ const downloadWork = async (
   const { workId, displayId } = target;
   const targetPath = join(config.downloadDir, displayId);
   if (await pathExists(targetPath)) {
-    return (await stat(targetPath)).isDirectory()
+    const info = await lstat(targetPath);
+    if (info.isSymbolicLink()) {
+      return { workId, displayId, status: "failed", error: `目标路径是符号链接：${targetPath}` };
+    }
+    return info.isDirectory()
       ? { workId, displayId, status: "skipped", targetPath }
       : { workId, displayId, status: "failed", error: `目标路径存在但不是文件夹：${targetPath}` };
   }
@@ -225,6 +274,10 @@ const downloadWork = async (
   let stagingPath = join(stagingRoot, displayId);
   try {
     await mkdir(stagingRoot, { recursive: true });
+    const stagingRootInfo = await lstat(stagingRoot);
+    if (stagingRootInfo.isSymbolicLink() || !stagingRootInfo.isDirectory()) {
+      throw new Error(`下载临时根路径不是普通文件夹：${stagingRoot}`);
+    }
     stagingPath = await prepareStagingPath(stagingRoot, displayId);
     logger.info(`下载完整作品 ${displayId} ...`);
     await downloadWithBuiltin(workId, stagingPath, config, settings ?? await readDownloaderSettings(resolve("."), config));
@@ -260,6 +313,17 @@ export async function downloadWorks(
       ? (downloadOne as NumericDownloadOne)(entry.input, config)
       : (downloadOne as TargetDownloadOne)(entry.input, config);
   };
+  const runSafely = async (entry: typeof entries[number]): Promise<DownloadResult> => {
+    try {
+      return await run(entry);
+    } catch (error) {
+      return {
+        ...entry.target,
+        status: "failed",
+        error: errorMessage(error),
+      };
+    }
+  };
   const results: DownloadResult[] = [];
   let downloadedSize = 0;
   let stoppedByLimit = false;
@@ -267,7 +331,7 @@ export async function downloadWorks(
   let pendingRetryCount = 0;
   for (const [index, entry] of entries.entries()) {
     logger.info(`[作品 ${index + 1}/${entries.length}] ${entry.target.displayId}`);
-    const result = await run(entry);
+    const result = await runSafely(entry);
     results.push(result);
     attemptedCount += 1;
     if (result.status === "downloaded") {
@@ -289,7 +353,7 @@ export async function downloadWorks(
     for (const [retryIndex, resultIndex] of failedIndexes.entries()) {
       const entry = entries[resultIndex];
       logger.info(`[重试 ${retryIndex + 1}/${failedIndexes.length}] ${entry.target.displayId}`);
-      const result = await run(entry);
+      const result = await runSafely(entry);
       results[resultIndex] = result;
       if (result.status === "downloaded") {
         downloadedSize += result.size ?? 0;

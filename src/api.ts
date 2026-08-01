@@ -4,10 +4,21 @@ import { errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type { Config, RequestThrottle, SearchResponse, SearchWork } from "./types.ts";
 
-type HttpError = Error & { status: number };
+type HttpError = Error & { status: number; retryAfterMs?: number };
 
-const httpError = (status: number, statusText: string): HttpError =>
-  Object.assign(new Error(`HTTP ${status} ${statusText}`), { status });
+const retryAfterMilliseconds = (value: string | null): number | undefined => {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 60_000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.min(Math.max(0, date - Date.now()), 60_000) : undefined;
+};
+
+const httpError = (response: Response): HttpError =>
+  Object.assign(new Error(`HTTP ${response.status} ${response.statusText}`), {
+    status: response.status,
+    retryAfterMs: retryAfterMilliseconds(response.headers.get("retry-after")),
+  });
 
 const isHttpError = (error: unknown): error is HttpError =>
   error instanceof Error && "status" in error && typeof error.status === "number";
@@ -66,12 +77,14 @@ export async function fetchJson<T>(
         signal: controller.signal,
         ...(proxyUrl ? { proxy: proxyUrl } : {}),
       });
-      if (!response.ok) throw httpError(response.status, response.statusText);
+      if (!response.ok) throw httpError(response);
       return (await response.json()) as T;
     } catch (error) {
       lastError = error;
       if (attempt < attempts && isRetryable(error)) {
-        const delayMs = Math.min(500 * 2 ** (attempt - 1), 8_000);
+        const delayMs = isHttpError(error) && error.retryAfterMs !== undefined
+          ? error.retryAfterMs
+          : Math.min(500 * 2 ** (attempt - 1), 8_000);
         logger.warn(`API 请求失败（${attempt}/${attempts}）：${errorMessage(error)}；${delayMs} 毫秒后重试`);
         await Bun.sleep(delayMs);
       } else if (!isRetryable(error)) {
@@ -84,12 +97,14 @@ export async function fetchJson<T>(
   throw new Error(`请求失败 ${url}：${errorMessage(lastError)}`);
 }
 
-const validateSearchResponse = (value: SearchResponse): void => {
-  const pagination = value?.pagination;
+export function validateSearchResponse(value: unknown): asserts value is SearchResponse {
+  const record = typeof value === "object" && value !== null ? value as Partial<SearchResponse> : undefined;
+  const pagination = record?.pagination;
   if (
-    !value ||
-    !Array.isArray(value.works) ||
-    !Number.isSafeInteger(pagination?.currentPage) ||
+    !record ||
+    !Array.isArray(record.works) ||
+    !pagination ||
+    !Number.isSafeInteger(pagination.currentPage) ||
     pagination.currentPage < 1 ||
     !Number.isSafeInteger(pagination.pageSize) ||
     pagination.pageSize < 1 ||
@@ -98,7 +113,18 @@ const validateSearchResponse = (value: SearchResponse): void => {
   ) {
     throw new Error("作品列表 API 返回了无法识别的数据结构");
   }
-};
+  for (const work of record.works) {
+    if (
+      typeof work !== "object" ||
+      work === null ||
+      !Number.isSafeInteger(work.id) ||
+      work.id < 1 ||
+      (work.source_id !== undefined && typeof work.source_id !== "string")
+    ) {
+      throw new Error("作品列表 API 返回了无效的作品记录");
+    }
+  }
+}
 
 export async function fetchAllWorks(
   config: Config,
@@ -118,7 +144,6 @@ export async function fetchAllWorks(
     return response.works;
   });
   return [...new Map([first.works, ...responses].flat()
-    .filter((work) => Number.isInteger(work.id))
     .map((work) => [work.id, work])).values()]
     .toSorted((left, right) => right.id - left.id);
 }

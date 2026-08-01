@@ -15,6 +15,37 @@ import type {
   NonAuthorDeletionFailure,
 } from "./types.ts";
 
+type FileIdentity = {
+  device: number | bigint;
+  inode: number | bigint;
+  size: number | bigint;
+  modifiedAt: number | bigint;
+  changedAt: number | bigint;
+};
+
+type DeletionMetadata = { canonicalPath: string; identity: FileIdentity };
+
+const archiveDeletionMetadata = new WeakMap<DeletionCandidate, DeletionMetadata>();
+const nonAuthorDeletionMetadata = new WeakMap<NonAuthorDeletionCandidate, DeletionMetadata>();
+
+const fileIdentity = (info: Awaited<ReturnType<typeof lstat>>): FileIdentity => ({
+  device: info.dev,
+  inode: info.ino,
+  size: info.size,
+  modifiedAt: info.mtimeMs,
+  changedAt: info.ctimeMs,
+});
+
+const samePath = (left: string, right: string): boolean =>
+  process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+
+const sameIdentity = (left: FileIdentity, right: FileIdentity): boolean =>
+  left.device === right.device &&
+  left.inode === right.inode &&
+  left.size === right.size &&
+  left.modifiedAt === right.modifiedAt &&
+  left.changedAt === right.changedAt;
+
 export async function buildDeletionPlan(incomplete: IncompleteArchive[], archiveDir: string): Promise<DeletionCandidate[]> {
   const root = resolve(archiveDir);
   const canonicalRoot = await realpath(root);
@@ -28,7 +59,7 @@ export async function buildDeletionPlan(incomplete: IncompleteArchive[], archive
     if (!containsPath(canonicalRoot, canonicalPath) || canonicalPath === canonicalRoot) {
       throw new Error(`拒绝删除 archiveDir 之外的文件：${archivePath}`);
     }
-    return { archivePath, canonicalPath, workCode: workCodeOf(item), size: info.size };
+    return { archivePath, canonicalPath, identity: fileIdentity(info), workCode: workCodeOf(item), size: info.size };
   });
   const candidates = new Map<string, typeof resolved[number]>();
   for (const candidate of resolved) {
@@ -39,19 +70,28 @@ export async function buildDeletionPlan(incomplete: IncompleteArchive[], archive
     }
     candidates.set(key, candidate);
   }
-  return [...candidates.values()].map(({ canonicalPath: _, ...candidate }) => candidate);
+  return [...candidates.values()].map(({ canonicalPath, identity, ...candidate }) => {
+    archiveDeletionMetadata.set(candidate, { canonicalPath, identity });
+    return candidate;
+  });
 }
 
 export async function deleteArchives(candidates: DeletionCandidate[]): Promise<DeletionFailure[]> {
   const failures: DeletionFailure[] = [];
   for (const candidate of candidates) {
     try {
+      const metadata = archiveDeletionMetadata.get(candidate);
+      if (!metadata) throw new Error("删除候选缺少安全规划信息，请重新生成删除计划");
       const info = await lstat(candidate.archivePath);
       if (info.isSymbolicLink() || !info.isFile() || extname(candidate.archivePath).toLowerCase() !== ".7z") {
         throw new Error("目标不再是普通 7z 文件");
       }
       const actualCode = workCodeFromArchiveName(candidate.archivePath);
       if (actualCode !== workCodeOf(candidate)) throw new Error("目标作品编号已变化");
+      const canonicalPath = await realpath(candidate.archivePath);
+      if (!samePath(canonicalPath, metadata.canonicalPath) || !sameIdentity(fileIdentity(info), metadata.identity)) {
+        throw new Error("目标在删除确认期间已被替换或修改");
+      }
       await unlink(candidate.archivePath);
     } catch (error) {
       failures.push({ archivePath: candidate.archivePath, error: errorMessage(error) });
@@ -95,6 +135,7 @@ export async function buildNonAuthorDeletionPlan(
       ...work,
       path: targetPath,
       canonicalPath,
+      identity: fileIdentity(info),
       size: work.type === "压缩包" ? info.size : await directorySize(targetPath),
     };
   });
@@ -116,19 +157,28 @@ export async function buildNonAuthorDeletionPlan(
       parent.canonicalPath !== candidate.canonicalPath &&
       containsPath(parent.canonicalPath, candidate.canonicalPath)
     ))
-    .map(({ canonicalPath: _, ...candidate }) => candidate);
+    .map(({ canonicalPath, identity, ...candidate }) => {
+      nonAuthorDeletionMetadata.set(candidate, { canonicalPath, identity });
+      return candidate;
+    });
 }
 
 export async function deleteNonAuthorWorks(candidates: NonAuthorDeletionCandidate[]): Promise<NonAuthorDeletionFailure[]> {
   const failures: NonAuthorDeletionFailure[] = [];
   for (const candidate of candidates) {
     try {
+      const metadata = nonAuthorDeletionMetadata.get(candidate);
+      if (!metadata) throw new Error("删除候选缺少安全规划信息，请重新生成删除计划");
       const info = await lstat(candidate.path);
       if (info.isSymbolicLink()) throw new Error("目标已变为符号链接");
       const actualCode = workCodeFromArchiveName(
         candidate.type === "文件夹" ? `${basename(candidate.path)}.7z` : candidate.path,
       );
       if (actualCode !== workCodeOf(candidate)) throw new Error("目标作品编号已变化");
+      const canonicalPath = await realpath(candidate.path);
+      if (!samePath(canonicalPath, metadata.canonicalPath) || !sameIdentity(fileIdentity(info), metadata.identity)) {
+        throw new Error("目标在删除确认期间已被替换或修改");
+      }
       if (candidate.type === "压缩包") {
         if (!info.isFile() || extname(candidate.path).toLowerCase() !== ".7z") throw new Error("目标不再是普通 7z 文件");
         await unlink(candidate.path);

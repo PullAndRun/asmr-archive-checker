@@ -42,7 +42,8 @@ Copy-Item config.example.json config.json
   "sevenZipPath": "7z",
   "maxDownloadSize": "100 GB",
   "concurrency": 4,
-  "requestTimeoutMs": 30000
+  "requestTimeoutMs": 30000,
+  "archiveTimeoutMs": 300000
 }
 ```
 
@@ -54,6 +55,7 @@ Copy-Item config.example.json config.json
 - `maxDownloadSize`：单次运行允许完成下载的最大总体积，例如 `"100 GB"`。支持 B、KB、MB、GB、TB（按 1024 换算）；设为 `""` 表示不限制；
 - `concurrency`：API 和压缩包检查的并发数，范围 1–20；
 - `requestTimeoutMs`：单次 API 请求超时毫秒数。
+- `archiveTimeoutMs`：单个压缩包执行 7-Zip 列表检查的超时毫秒数，默认 300000（5 分钟）。
 
 相对路径均以配置文件所在目录为基准。
 

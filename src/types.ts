@@ -9,6 +9,7 @@ export type Config = {
   sevenZipPath: string;
   concurrency: number;
   requestTimeoutMs: number;
+  archiveTimeoutMs?: number;
   maxDownloadSize: string;
   maxDownloadSizeBytes?: number;
 };

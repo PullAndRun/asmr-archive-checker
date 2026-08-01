@@ -55,6 +55,7 @@ export function flattenTrackTree(nodes: TrackNode[]): string[] {
   const pending: Array<{ node: TrackNode; parent?: ParentPath }> = nodes.toReversed().map((node) => ({ node }));
   while (pending.length > 0) {
     const { node, parent } = pending.pop()!;
+    if (!node || typeof node !== "object") continue;
     const title = typeof node.title === "string" ? node.title : "";
     if (Array.isArray(node.children)) {
       const nextParent = title ? { value: title, parent } : parent;
@@ -130,6 +131,7 @@ export function buildDownloadFilePlan(nodes: TrackNode[]): DownloadFile[] {
   const pending: Array<{ node: TrackNode; parent?: ParentPath }> = nodes.toReversed().map((node) => ({ node }));
   while (pending.length > 0) {
     const { node, parent } = pending.pop()!;
+    if (!node || typeof node !== "object") continue;
     const title = typeof node.title === "string" ? node.title : "";
     if (Array.isArray(node.children)) {
       const nextParent = title ? { value: sanitizeDownloadPathSegment(title), parent } : parent;
@@ -147,14 +149,19 @@ export function buildDownloadFilePlan(nodes: TrackNode[]): DownloadFile[] {
 
   const planned: DownloadFile[] = [];
   const used = new Set<string>();
+  const nextCollisionSequence = new Map<string, number>();
   for (const file of files) {
     let relativePath = file.relativePath;
-    let sequence = 2;
-    while (used.has(comparisonKey(relativePath))) {
+    const originalKey = comparisonKey(relativePath);
+    let key = originalKey;
+    let sequence = nextCollisionSequence.get(originalKey) ?? 2;
+    while (used.has(key)) {
       relativePath = addCollisionSuffix(file.relativePath, sequence);
       sequence += 1;
+      key = comparisonKey(relativePath);
     }
-    used.add(comparisonKey(relativePath));
+    nextCollisionSequence.set(originalKey, sequence);
+    used.add(key);
     planned.push({ ...file, relativePath });
   }
   return planned;

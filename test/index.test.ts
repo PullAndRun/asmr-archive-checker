@@ -13,6 +13,7 @@ import {
   deleteArchives,
   deleteNonAuthorWorks,
   downloadWorks,
+  ensureSafeDownloadDirectory,
   buildNonAuthorWorkList,
   findMissingFiles,
   findNonAuthorWorks,
@@ -37,6 +38,7 @@ import {
   workCodeFromArchiveName,
   workCodeFromSearchWork,
   workIdFromArchiveName,
+  validateSearchResponse,
   writeResponseBodyToFile,
 } from "../src/index.ts";
 import { mapLimit } from "../src/shared.ts";
@@ -83,6 +85,23 @@ describe("下载器调用", () => {
     expect(files.map((file) => file.relativePath)).toEqual(["声音.wav", "声音.mp3", "封面.jpg"]);
   });
 
+  test("大量同名资源在线性冲突分配中保持唯一", () => {
+    const files = buildDownloadFilePlan(Array.from({ length: 1_000 }, (_, index) => ({
+      type: "audio",
+      title: "同名.wav",
+      mediaDownloadUrl: `https://example.com/${index}`,
+    })));
+    expect(new Set(files.map((file) => file.relativePath)).size).toBe(1_000);
+    expect(files.at(-1)?.relativePath).toBe("同名 (1000).wav");
+  });
+
+  test("忽略文件树中的无效空节点", () => {
+    expect(buildDownloadFilePlan([
+      null as never,
+      { type: "audio", title: "声音.wav", mediaDownloadUrl: "https://example.com/audio" },
+    ])).toEqual([{ url: "https://example.com/audio", relativePath: "声音.wav" }]);
+  });
+
   test("只复用大小完整的已下载文件", () => {
     expect(isCompleteDownloadFile(1024, 1024)).toBeTrue();
     expect(isCompleteDownloadFile(512, 1024)).toBeFalse();
@@ -125,6 +144,22 @@ describe("下载器调用", () => {
       expect([...new Uint8Array(await Bun.file(path).arrayBuffer())]).toEqual([1, 2, 3, 4, 5]);
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("拒绝通过临时目录内的链接向外创建下载目录", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-download-link-root-"));
+    const outside = await mkdtemp(join(tmpdir(), "asmr-archive-download-link-outside-"));
+    try {
+      const linkedDirectory = join(root, "linked");
+      await symlink(outside, linkedDirectory, process.platform === "win32" ? "junction" : "dir");
+      await expect(ensureSafeDownloadDirectory(root, join(linkedDirectory, "created"))).rejects.toThrow("链接");
+      expect(await Bun.file(join(outside, "created")).exists()).toBeFalse();
+    } finally {
+      await Promise.all([
+        rm(root, { recursive: true, force: true }),
+        rm(outside, { recursive: true, force: true }),
+      ]);
     }
   });
 });
@@ -449,9 +484,40 @@ describe("下载体积限制", () => {
     expect(batch.remainingCount).toBe(1);
     expect(batch.results.map((result) => result.status)).toEqual(["downloaded", "downloaded"]);
   });
+
+  test("隔离下载执行器的意外抛错并完成一次重试", async () => {
+    const config = {
+      author: "",
+      archiveDir: ".",
+      downloadDir: ".",
+      outputDir: "./output",
+      sevenZipPath: "7z",
+      concurrency: 1,
+      requestTimeoutMs: 30_000,
+      maxDownloadSize: "",
+    };
+    let attempts = 0;
+    const batch = await downloadWorks([1], config, async () => {
+      attempts += 1;
+      throw new Error("执行器崩溃");
+    });
+    expect(attempts).toBe(2);
+    expect(batch.results).toMatchObject([{ status: "failed", error: "执行器崩溃" }]);
+  });
 });
 
 describe("API 请求", () => {
+  test("拒绝 API 数组中的空值和无效作品记录", () => {
+    expect(() => validateSearchResponse({
+      works: [null],
+      pagination: { currentPage: 1, pageSize: 100, totalCount: 1 },
+    })).toThrow("无效的作品记录");
+    expect(() => validateSearchResponse({
+      works: [{ id: 1 }],
+      pagination: { currentPage: 1, pageSize: 100, totalCount: 1 },
+    })).not.toThrow();
+  });
+
   test("按配置的 QPS 串行限制并发请求", async () => {
     const throttle = createRequestThrottle(20);
     const startedAt = performance.now();
@@ -520,6 +586,27 @@ describe("删除不完整作品", () => {
       expect(formatFileSize(plan[0].size)).toBe("2.00 KB");
       expect(await deleteArchives(plan)).toEqual([]);
       expect(await Bun.file(archivePath).exists()).toBeFalse();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("拒绝删除确认期间被替换的同名文件", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-replaced-test-"));
+    try {
+      const archivePath = join(root, "RJ01000000.7z");
+      await Bun.write(archivePath, "old archive");
+      const plan = await buildDeletionPlan([{
+        archivePath,
+        workCode: "RJ01000000",
+        workId: 1000000,
+        missingFiles: ["missing.wav"],
+      }], root);
+      await rm(archivePath, { force: true });
+      await Bun.write(archivePath, "replacement archive");
+
+      expect(await deleteArchives(plan)).toMatchObject([{ archivePath }]);
+      expect(await Bun.file(archivePath).text()).toBe("replacement archive");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -68,7 +68,10 @@ export function classifyArchives(paths: string[]): { recognized: CodedLocalWork[
   return { recognized, unknown };
 }
 
-export async function listArchive(path: string, sevenZipPath: string): Promise<ArchiveEntry[]> {
+export async function listArchive(path: string, sevenZipPath: string, timeoutMs = 300_000): Promise<ArchiveEntry[]> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000) {
+    throw new Error(`7-Zip 超时必须不少于 1000 毫秒，实际为 ${timeoutMs}`);
+  }
   let process: ReturnType<typeof Bun.spawn>;
   try {
     process = Bun.spawn([sevenZipPath, "l", "-slt", "-sccUTF-8", "--", path], {
@@ -80,9 +83,34 @@ export async function listArchive(path: string, sevenZipPath: string): Promise<A
   if (!(process.stdout instanceof ReadableStream) || !(process.stderr instanceof ReadableStream)) {
     throw new Error("7-Zip 子进程未提供可读的输出流");
   }
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited,
-  ]);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      process.kill();
+    } catch {
+      // The process may have exited between the timeout and the kill call.
+    }
+  }, timeoutMs);
+  let stdout: string;
+  let stderr: string;
+  let exitCode: number;
+  try {
+    [stdout, stderr, exitCode] = await Promise.all([
+      new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited,
+    ]);
+  } catch (error) {
+    try {
+      process.kill();
+      await process.exited;
+    } catch {
+      // Preserve the original stream/process error.
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (timedOut) throw new Error(`7-Zip 列出文件超时（${timeoutMs} 毫秒）：${path}`);
   if (exitCode !== 0) throw new Error(`7-Zip 返回代码 ${exitCode}：${stderr.trim() || stdout.trim()}`);
   return parseSevenZipListing(stdout);
 }
@@ -98,10 +126,18 @@ export async function checkArchive(
   let workId = knownWorkId;
   try {
     if (workId === undefined) workId = (await fetchWorkByCode(workCode, config, proxyUrl, throttle)).id;
-    const [archiveEntries, trackTree] = await Promise.all([
-      listArchive(archivePath, config.sevenZipPath),
+    const [archiveResult, trackResult] = await Promise.allSettled([
+      listArchive(archivePath, config.sevenZipPath, config.archiveTimeoutMs),
       fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config.requestTimeoutMs, 4, proxyUrl, throttle),
     ]);
+    if (archiveResult.status === "rejected" || trackResult.status === "rejected") {
+      const failures = [archiveResult, trackResult]
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => errorMessage(result.reason));
+      throw new Error(failures.join("；"));
+    }
+    const archiveEntries = archiveResult.value;
+    const trackTree = trackResult.value;
     if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
     const expectedPaths = flattenTrackTree(trackTree);
     if (expectedPaths.length === 0) throw new Error("网站文件列表为空，无法判断完整性");
