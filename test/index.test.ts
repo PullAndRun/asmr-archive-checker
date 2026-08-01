@@ -9,6 +9,7 @@ import {
   buildNonAuthorDeletionPlan,
   buildSearchUrl,
   buildWorkSearchUrl,
+  createRequestThrottle,
   deleteArchives,
   deleteNonAuthorWorks,
   downloadWorks,
@@ -320,6 +321,15 @@ describe("下载体积限制", () => {
     expect(batch.stoppedByLimit).toBeTrue();
     expect(batch.remainingCount).toBe(1);
     expect(batch.results.map((result) => result.status)).toEqual(["downloaded", "downloaded"]);
+  });
+});
+
+describe("API 请求", () => {
+  test("按配置的 QPS 串行限制并发请求", async () => {
+    const throttle = createRequestThrottle(20);
+    const startedAt = performance.now();
+    await Promise.all([throttle(), throttle(), throttle()]);
+    expect(performance.now() - startedAt).toBeGreaterThanOrEqual(90);
   });
 });
 

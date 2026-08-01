@@ -60,7 +60,10 @@ type DownloaderSettings = {
   preferMedia: string;
   proxyUrl: string;
   requestTimeoutMs: number;
+  syncQps: number;
 };
+
+type RequestThrottle = () => Promise<void>;
 
 type ArchiveEntry = {
   path: string;
@@ -373,9 +376,16 @@ export function buildWorkSearchUrl(id: number): string {
   return url.toString();
 }
 
-async function fetchJson<T>(url: string, timeoutMs: number, attempts = 4, proxyUrl = ""): Promise<T> {
+async function fetchJson<T>(
+  url: string,
+  timeoutMs: number,
+  attempts = 4,
+  proxyUrl = "",
+  throttle?: RequestThrottle,
+): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (throttle) await throttle();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -390,7 +400,13 @@ async function fetchJson<T>(url: string, timeoutMs: number, attempts = 4, proxyU
       return (await response.json()) as T;
     } catch (error) {
       lastError = error;
-      if (attempt < attempts) await Bun.sleep(500 * 2 ** (attempt - 1));
+      if (attempt < attempts) {
+        const delayMs = 500 * 2 ** (attempt - 1);
+        console.warn(
+          `API 请求失败（${attempt}/${attempts}）：${errorMessage(error)}；${delayMs} 毫秒后重试`,
+        );
+        await Bun.sleep(delayMs);
+      }
     } finally {
       clearTimeout(timer);
     }
@@ -398,14 +414,27 @@ async function fetchJson<T>(url: string, timeoutMs: number, attempts = 4, proxyU
   throw new Error(`请求失败 ${url}：${errorMessage(lastError)}`);
 }
 
-async function fetchAllWorks(config: Config): Promise<SearchWork[]> {
-  const first = await fetchJson<SearchResponse>(buildSearchUrl(config.author, 1), config.requestTimeoutMs);
+async function fetchAllWorks(config: Config, proxyUrl = "", throttle?: RequestThrottle): Promise<SearchWork[]> {
+  console.log(`正在读取作者作品列表${proxyUrl ? "（使用代理）" : ""}...`);
+  const first = await fetchJson<SearchResponse>(
+    buildSearchUrl(config.author, 1),
+    config.requestTimeoutMs,
+    4,
+    proxyUrl,
+    throttle,
+  );
   validateSearchResponse(first);
   const totalPages = Math.max(1, Math.ceil(first.pagination.totalCount / first.pagination.pageSize));
   const remainingPages = Array.from({ length: totalPages - 1 }, (_, index) => index + 2);
   const responses = await mapLimit(remainingPages, config.concurrency, async (page) => {
     process.stdout.write(`\r正在读取作者作品列表：${page}/${totalPages}`);
-    const response = await fetchJson<SearchResponse>(buildSearchUrl(config.author, page), config.requestTimeoutMs);
+    const response = await fetchJson<SearchResponse>(
+      buildSearchUrl(config.author, page),
+      config.requestTimeoutMs,
+      4,
+      proxyUrl,
+      throttle,
+    );
     validateSearchResponse(response);
     return response.works;
   });
@@ -418,8 +447,19 @@ async function fetchAllWorks(config: Config): Promise<SearchWork[]> {
   return [...unique.values()].sort((a, b) => b.id - a.id);
 }
 
-async function fetchWorkById(id: number, config: Config): Promise<SearchWork> {
-  const response = await fetchJson<SearchResponse>(buildWorkSearchUrl(id), config.requestTimeoutMs);
+async function fetchWorkById(
+  id: number,
+  config: Config,
+  proxyUrl = "",
+  throttle?: RequestThrottle,
+): Promise<SearchWork> {
+  const response = await fetchJson<SearchResponse>(
+    buildWorkSearchUrl(id),
+    config.requestTimeoutMs,
+    4,
+    proxyUrl,
+    throttle,
+  );
   validateSearchResponse(response);
   const work = response.works.find((candidate) => candidate.id === id);
   if (!work) throw new Error(`搜索 ${formatWorkId(id)} 时没有找到精确匹配的作品`);
@@ -692,12 +732,20 @@ async function checkArchive(
   workId: number,
   config: Config,
   verifyWorkExists = false,
+  proxyUrl = "",
+  throttle?: RequestThrottle,
 ): Promise<IncompleteArchive | undefined> {
   try {
-    if (verifyWorkExists) await fetchWorkById(workId, config);
+    if (verifyWorkExists) await fetchWorkById(workId, config, proxyUrl, throttle);
     const [archiveEntries, trackTree] = await Promise.all([
       listArchive(archivePath, config.sevenZipPath),
-      fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config.requestTimeoutMs),
+      fetchJson<TrackNode[]>(
+        `${API_BASE_URL}/api/tracks/${workId}?v=2`,
+        config.requestTimeoutMs,
+        4,
+        proxyUrl,
+        throttle,
+      ),
     ]);
     if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
     const expectedPaths = flattenTrackTree(trackTree);
@@ -1118,6 +1166,23 @@ function parseTomlValue(text: string, section: string, key: string): string | un
   return undefined;
 }
 
+export function createRequestThrottle(requestsPerSecond: number): RequestThrottle {
+  const intervalMs = 1_000 / requestsPerSecond;
+  let nextRequestAt = 0;
+  let queue = Promise.resolve();
+
+  return () => {
+    const scheduled = queue.then(async () => {
+      const now = Date.now();
+      const delayMs = Math.max(0, nextRequestAt - now);
+      if (delayMs > 0) await Bun.sleep(delayMs);
+      nextRequestAt = Math.max(Date.now(), nextRequestAt) + intervalMs;
+    });
+    queue = scheduled.catch(() => undefined);
+    return scheduled;
+  };
+}
+
 async function readDownloaderSettings(workingDirectory: string, config: Config): Promise<DownloaderSettings> {
   const settings: DownloaderSettings = {
     maxRetries: 3,
@@ -1125,16 +1190,19 @@ async function readDownloaderSettings(workingDirectory: string, config: Config):
     preferMedia: "all",
     proxyUrl: "",
     requestTimeoutMs: config.requestTimeoutMs,
+    syncQps: 2,
   };
   const file = Bun.file(join(workingDirectory, ".asmroner-data", "config.toml"));
   if (!(await file.exists())) return settings;
   const text = await file.text();
   const maxRetries = Number.parseInt(parseTomlValue(text, "downloader", "max_retries") ?? "", 10);
   const maxWorkers = Number.parseInt(parseTomlValue(text, "downloader", "max_workers") ?? "", 10);
+  const syncQps = Number.parseFloat(parseTomlValue(text, "limit", "sync_qps") ?? "");
   if (Number.isInteger(maxRetries) && maxRetries >= 0) settings.maxRetries = maxRetries;
   if (Number.isInteger(maxWorkers) && maxWorkers > 0) settings.maxWorkers = Math.min(maxWorkers, 20);
   settings.preferMedia = parseTomlValue(text, "downloader", "prefer_media") || settings.preferMedia;
   settings.proxyUrl = parseTomlValue(text, "downloader", "proxy_url") || "";
+  if (Number.isFinite(syncQps) && syncQps > 0) settings.syncQps = syncQps;
   return settings;
 }
 
@@ -1584,7 +1652,12 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
     .map((path) => ({ path, workId: workIdFromArchiveName(path) }))
     .filter((item): item is { path: string; workId: number } => item.workId !== undefined);
   const unknownArchives = archives.filter((path) => workIdFromArchiveName(path) === undefined);
-  const works = cli.mode === "author" ? await fetchAllWorks(config) : [];
+  const apiSettings = await readDownloaderSettings(resolve("."), config);
+  const apiThrottle = createRequestThrottle(apiSettings.syncQps);
+  console.log(`API 请求速率：每秒最多 ${apiSettings.syncQps} 次`);
+  const works = cli.mode === "author"
+    ? await fetchAllWorks(config, apiSettings.proxyUrl, apiThrottle)
+    : [];
   const websiteIds = new Set(works.map((work) => work.id));
   const archivesToCheck = cli.mode === "author"
     ? recognizedArchives.filter((archive) => websiteIds.has(archive.workId))
@@ -1603,6 +1676,8 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
       archive.workId,
       config,
       cli.mode === "archives",
+      apiSettings.proxyUrl,
+      apiThrottle,
     );
   });
   const incomplete = checked.filter((item): item is IncompleteArchive => item !== undefined);

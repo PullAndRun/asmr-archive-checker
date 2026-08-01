@@ -18,7 +18,7 @@
 - 7-Zip，命令行可运行 `7z`；
 - [asmr-downloader](https://github.com/fireinrain/asmr-downloader/releases)，命令行可运行 `asmroner`，并且已执行 `asmroner config` 完成初始化。
 
-Windows 下的 `asmroner v2.0.6` 会错误清洗完整绝对路径和作品文件名：前者会生成 `C_` 文件夹，后者遇到 `?` 等字符会下载失败。因此 Windows 下载模式直接使用网站文件列表下载，并安全清洗文件名；文件响应会以分块流方式直接写入磁盘，避免并发下载大文件时占用过多内存。它仍读取项目下 `.asmroner-data/config.toml` 中的 `proxy_url`、`prefer_media`、`max_retries` 和 `max_workers`。其他平台继续调用 `asmroner`。每次下载的都是整部作品，不会只补缺失文件。
+Windows 下的 `asmroner v2.0.6` 会错误清洗完整绝对路径和作品文件名：前者会生成 `C_` 文件夹，后者遇到 `?` 等字符会下载失败。因此 Windows 下载模式直接使用网站文件列表下载，并安全清洗文件名；文件响应会以分块流方式直接写入磁盘，避免并发下载大文件时占用过多内存。程序读取项目下 `.asmroner-data/config.toml` 中的 `proxy_url`、`prefer_media`、`max_retries` 和 `max_workers`；`author` 和 `archives` 模式的 API 请求也使用该 `proxy_url`，并按 `sync_qps` 限速。其他平台继续调用 `asmroner`。每次下载的都是整部作品，不会只补缺失文件。
 
 ## 配置
 
