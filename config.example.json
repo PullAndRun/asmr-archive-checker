@@ -5,6 +5,7 @@
   "outputDir": "./output",
   "sevenZipPath": "7z",
   "downloaderPath": "asmroner",
+  "maxDownloadSize": "100 GB",
   "concurrency": 4,
   "requestTimeoutMs": 30000
 }

@@ -37,6 +37,7 @@ Copy-Item config.example.json config.json
   "outputDir": "./output",
   "sevenZipPath": "7z",
   "downloaderPath": "asmroner",
+  "maxDownloadSize": "100 GB",
   "concurrency": 4,
   "requestTimeoutMs": 30000
 }
@@ -48,6 +49,7 @@ Copy-Item config.example.json config.json
 - `outputDir`：检查结果和待下载汇总所在目录；
 - `sevenZipPath`：7-Zip 命令或完整路径；
 - `downloaderPath`：`asmroner` 命令或完整路径；
+- `maxDownloadSize`：单次运行允许完成下载的最大总体积，例如 `"100 GB"`。支持 B、KB、MB、GB、TB（按 1024 换算）；设为 `""` 表示不限制；
 - `concurrency`：API 和压缩包检查的并发数，范围 1–20；
 - `requestTimeoutMs`：单次 API 请求超时毫秒数。
 
@@ -111,6 +113,14 @@ bun run download
 bun run download -- --download-dir "D:\音声\补全"
 ```
 
+也可以只为本次运行设置下载体积上限：
+
+```powershell
+bun run download -- --max-download-size "100 GB"
+```
+
+体积按本次成功完成的作品文件夹累计。达到或超过上限时，程序会先让当前作品完整下载并移动到最终目录，再停止队列中的后续作品；已经存在而被跳过的作品不计入本次体积。
+
 其他临时配置示例：
 
 ```powershell
@@ -129,6 +139,7 @@ bun run archives -- --dir "D:\音声\待检查" --output "D:\检查结果"
 - 网站列出的任何文件缺失都会判为不完整；压缩包内的额外文件不影响结果；
 - 待下载汇总会把遗漏作品和不完整作品按编号去重；
 - `download` 模式逐行读取汇总，下载完整作品；
+- 设置下载体积限制后，每部作品完成时累计其文件夹体积；达到限制后停止开始下一部作品，不会切断当前作品；
 - 下载先进入 `downloadDir/.asmr-archive-checker-downloads` 下的临时目录，成功后移动并改名为八位 RJ 编号；Windows 非法文件名字符会替换为 `_`；
 - 标准名称的目标文件夹已经存在时会跳过，不覆盖已有文件；失败时保留每部作品固定的临时目录，再次运行会校验文件大小并续传尚未完成的文件。旧版本生成的随机临时目录也会自动选择数据最多的一份继续下载。
 

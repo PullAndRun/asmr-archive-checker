@@ -9,14 +9,17 @@ import {
   buildSearchUrl,
   buildWorkSearchUrl,
   deleteArchives,
+  downloadWorks,
   findMissingFiles,
   flattenTrackTree,
   formatFileSize,
   formatWorkId,
+  hasReachedDownloadSizeLimit,
   isCompleteDownloadFile,
   parseArgs,
   parseDeletionQueue,
   parseDownloadQueue,
+  parseFileSize,
   parseSevenZipListing,
   prepareBuiltinStagingPath,
   sanitizeDownloadPathSegment,
@@ -167,6 +170,13 @@ describe("命令行参数", () => {
     expect(parseArgs(["download"]).mode).toBe("download");
   });
 
+  test("支持临时设置下载体积限制", () => {
+    expect(parseArgs(["download", "--max-download-size", "1.5 GB"])).toMatchObject({
+      mode: "download",
+      maxDownloadSize: "1.5 GB",
+    });
+  });
+
   test("读取并去重待下载汇总", () => {
     expect(parseDownloadQueue([
       "作品ID\t原因\t来源",
@@ -199,6 +209,60 @@ describe("命令行参数", () => {
       "RJ01602072\tD:/voice/RJ01602072.7z",
       "",
     ].join("\n"));
+  });
+});
+
+describe("下载体积限制", () => {
+  test("解析常用二进制体积单位", () => {
+    expect(parseFileSize("512 MB")).toBe(512 * 1024 ** 2);
+    expect(parseFileSize("1.5GiB")).toBe(1.5 * 1024 ** 3);
+    expect(parseFileSize("2 TB")).toBe(2 * 1024 ** 4);
+  });
+
+  test("拒绝无单位、零值和未知单位", () => {
+    expect(() => parseFileSize("100")).toThrow("请使用 B、KB、MB、GB 或 TB");
+    expect(() => parseFileSize("0 GB")).toThrow("必须在");
+    expect(() => parseFileSize("10 PB")).toThrow("请使用 B、KB、MB、GB 或 TB");
+  });
+
+  test("只在完成作品后累计值达到上限时停止", () => {
+    const limit = parseFileSize("1 GB");
+    expect(hasReachedDownloadSizeLimit(limit - 1, limit)).toBeFalse();
+    expect(hasReachedDownloadSizeLimit(limit, limit)).toBeTrue();
+    expect(hasReachedDownloadSizeLimit(limit + 1, limit)).toBeTrue();
+    expect(hasReachedDownloadSizeLimit(limit + 1)).toBeFalse();
+  });
+
+  test("完成越过上限的当前作品后才停止后续队列", async () => {
+    const started: number[] = [];
+    const config = {
+      author: "",
+      archiveDir: ".",
+      downloadDir: ".",
+      outputDir: "./output",
+      sevenZipPath: "7z",
+      downloaderPath: "asmroner",
+      concurrency: 1,
+      requestTimeoutMs: 30_000,
+      maxDownloadSize: "10 B",
+      maxDownloadSizeBytes: 10,
+    };
+    const batch = await downloadWorks([1, 2, 3], config, async (workId) => {
+      started.push(workId);
+      return {
+        workId,
+        displayId: formatWorkId(workId),
+        status: "downloaded",
+        targetPath: `.\\${formatWorkId(workId)}`,
+        size: 6,
+      };
+    });
+
+    expect(started).toEqual([1, 2]);
+    expect(batch.downloadedSize).toBe(12);
+    expect(batch.stoppedByLimit).toBeTrue();
+    expect(batch.remainingCount).toBe(1);
+    expect(batch.results.map((result) => result.status)).toEqual(["downloaded", "downloaded"]);
   });
 });
 

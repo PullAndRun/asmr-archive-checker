@@ -18,6 +18,8 @@ export type Config = {
   downloaderPath: string;
   concurrency: number;
   requestTimeoutMs: number;
+  maxDownloadSize: string;
+  maxDownloadSizeBytes?: number;
 };
 
 export type Mode = "author" | "archives" | "delete" | "download";
@@ -82,13 +84,21 @@ export type DeletionFailure = {
   error: string;
 };
 
-type DownloadResult = {
+export type DownloadResult = {
   workId: number;
   displayId: string;
   status: "downloaded" | "skipped" | "failed";
   targetPath?: string;
   stagingPath?: string;
+  size?: number;
   error?: string;
+};
+
+export type DownloadBatchResult = {
+  results: DownloadResult[];
+  downloadedSize: number;
+  stoppedByLimit: boolean;
+  remainingCount: number;
 };
 
 type CliOptions = {
@@ -101,6 +111,7 @@ type CliOptions = {
   sevenZipPath?: string;
   downloaderPath?: string;
   concurrency?: number;
+  maxDownloadSize?: string;
   help: boolean;
 };
 
@@ -113,6 +124,7 @@ const DEFAULT_CONFIG: Config = {
   downloaderPath: "asmroner",
   concurrency: 4,
   requestTimeoutMs: 30_000,
+  maxDownloadSize: "",
 };
 
 function usage(): string {
@@ -133,6 +145,8 @@ function usage(): string {
   --7z <程序路径>       7z 可执行程序，默认 7z
   --downloader <路径>   asmroner 可执行程序，默认 asmroner
   --concurrency <数量>  API 并发数，默认 4
+  --max-download-size <体积>
+                        本次下载体积上限，例如 100 GB；默认不限制
   -h, --help            显示帮助`;
 }
 
@@ -156,6 +170,7 @@ export function parseArgs(args: string[]): CliOptions {
     "--7z": "sevenZipPath",
     "--downloader": "downloaderPath",
     "--concurrency": "concurrency",
+    "--max-download-size": "maxDownloadSize",
   };
 
   for (let index = 0; index < values.length; index += 1) {
@@ -208,6 +223,7 @@ async function loadConfig(cli: CliOptions): Promise<Config> {
     ...(cli.sevenZipPath !== undefined ? { sevenZipPath: cli.sevenZipPath } : {}),
     ...(cli.downloaderPath !== undefined ? { downloaderPath: cli.downloaderPath } : {}),
     ...(cli.concurrency !== undefined ? { concurrency: cli.concurrency } : {}),
+    ...(cli.maxDownloadSize !== undefined ? { maxDownloadSize: cli.maxDownloadSize } : {}),
   };
 
   if (typeof merged.author !== "string") throw new Error("author 必须是字符串");
@@ -236,6 +252,9 @@ async function loadConfig(cli: CliOptions): Promise<Config> {
   if (!Number.isFinite(merged.requestTimeoutMs) || merged.requestTimeoutMs < 1_000) {
     throw new Error("requestTimeoutMs 必须不少于 1000 毫秒");
   }
+  if (typeof merged.maxDownloadSize !== "string") {
+    throw new Error("maxDownloadSize 必须是带单位的体积字符串或空字符串");
+  }
 
   merged.author = merged.author.trim();
   merged.archiveDir = resolvePath(configBase, merged.archiveDir);
@@ -243,6 +262,10 @@ async function loadConfig(cli: CliOptions): Promise<Config> {
     ? resolvePath(configBase, merged.downloadDir)
     : "";
   merged.outputDir = resolvePath(configBase, merged.outputDir);
+  merged.maxDownloadSize = merged.maxDownloadSize.trim();
+  merged.maxDownloadSizeBytes = merged.maxDownloadSize
+    ? parseFileSize(merged.maxDownloadSize)
+    : undefined;
   if (looksLikePath(merged.sevenZipPath)) {
     merged.sevenZipPath = resolvePath(configBase, merged.sevenZipPath);
   }
@@ -696,6 +719,23 @@ export function formatFileSize(bytes: number): string {
   return `${value.toFixed(2)} ${unit}`;
 }
 
+export function parseFileSize(value: string): number {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*(B|K(?:I)?B|M(?:I)?B|G(?:I)?B|T(?:I)?B)$/i);
+  if (!match) {
+    throw new Error(`无法识别下载体积“${value}”；请使用 B、KB、MB、GB 或 TB，例如 100 GB`);
+  }
+  const powers: Record<string, number> = { B: 0, KB: 1, KIB: 1, MB: 2, MIB: 2, GB: 3, GIB: 3, TB: 4, TIB: 4 };
+  const bytes = Number(match[1]) * 1024 ** powers[match[2].toUpperCase()];
+  if (!Number.isFinite(bytes) || bytes < 1 || bytes > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`下载体积必须在 1 B 到 ${Number.MAX_SAFE_INTEGER} B 之间`);
+  }
+  return Math.floor(bytes);
+}
+
+export function hasReachedDownloadSizeLimit(downloadedSize: number, maxDownloadSize?: number): boolean {
+  return maxDownloadSize !== undefined && downloadedSize >= maxDownloadSize;
+}
+
 export async function buildDeletionPlan(
   incomplete: IncompleteArchive[],
   archiveDir: string,
@@ -1109,18 +1149,23 @@ async function downloadWork(workId: number, config: Config): Promise<DownloadRes
     else await downloadWithAsmroner(displayId, stagingPath, config);
 
     if (await pathExists(targetPath)) throw new Error(`目标文件夹已存在：${targetPath}`);
+    let completedPath = stagingPath;
     if (process.platform === "win32") {
+      const size = await directorySize(completedPath);
       await rename(stagingPath, targetPath);
+      return { workId, displayId, status: "downloaded", targetPath, size };
     } else {
       const entries = await readdir(stagingPath, { withFileTypes: true });
       const folders = entries.filter((entry) => entry.isDirectory());
       if (folders.length !== 1) {
         throw new Error(`下载目录中应有 1 个作品文件夹，实际为 ${folders.length} 个`);
       }
-      await rename(join(stagingPath, folders[0].name), targetPath);
+      completedPath = join(stagingPath, folders[0].name);
+      const size = await directorySize(completedPath);
+      await rename(completedPath, targetPath);
       await rmdir(stagingPath).catch(() => undefined);
+      return { workId, displayId, status: "downloaded", targetPath, size };
     }
-    return { workId, displayId, status: "downloaded", targetPath };
   } catch (error) {
     return {
       workId,
@@ -1132,14 +1177,33 @@ async function downloadWork(workId: number, config: Config): Promise<DownloadRes
   }
 }
 
-async function downloadWorks(workIds: number[], config: Config): Promise<DownloadResult[]> {
+export async function downloadWorks(
+  workIds: number[],
+  config: Config,
+  downloadOne: (workId: number, config: Config) => Promise<DownloadResult> = downloadWork,
+): Promise<DownloadBatchResult> {
   const uniqueIds = [...new Set(workIds)];
   const results: DownloadResult[] = [];
+  let downloadedSize = 0;
+  let stoppedByLimit = false;
+  let attemptedCount = 0;
   for (const [index, workId] of uniqueIds.entries()) {
     console.log(`\n[作品 ${index + 1}/${uniqueIds.length}] ${displayWorkId(workId)}`);
-    const result = await downloadWork(workId, config);
+    const result = await downloadOne(workId, config);
     results.push(result);
-    if (result.status === "downloaded") console.log(`作品完成：${result.displayId}`);
+    attemptedCount += 1;
+    if (result.status === "downloaded") {
+      downloadedSize += result.size ?? 0;
+      console.log(`作品完成：${result.displayId}（${formatFileSize(result.size ?? 0)}）`);
+      if (hasReachedDownloadSizeLimit(downloadedSize, config.maxDownloadSizeBytes)) {
+        stoppedByLimit = true;
+        console.log(
+          `已达到本次下载体积限制：${formatFileSize(downloadedSize)} / ` +
+          `${formatFileSize(config.maxDownloadSizeBytes!)}；当前作品已完整下载，停止后续下载。`,
+        );
+        break;
+      }
+    }
     else if (result.status === "skipped") console.log(`作品已存在，跳过：${result.displayId}`);
     else {
       console.error(`作品失败：${result.displayId}：${result.error}`);
@@ -1150,14 +1214,25 @@ async function downloadWorks(workIds: number[], config: Config): Promise<Downloa
   const failedIndexes = results
     .map((result, index) => result.status === "failed" ? index : -1)
     .filter((index) => index >= 0);
-  if (failedIndexes.length > 0) {
+  if (!stoppedByLimit && failedIndexes.length > 0) {
     console.log(`\n首轮有 ${failedIndexes.length} 部作品失败，开始续传重试。`);
     for (const [retryIndex, resultIndex] of failedIndexes.entries()) {
       const workId = uniqueIds[resultIndex];
       console.log(`\n[重试 ${retryIndex + 1}/${failedIndexes.length}] ${displayWorkId(workId)}`);
-      const result = await downloadWork(workId, config);
+      const result = await downloadOne(workId, config);
       results[resultIndex] = result;
-      if (result.status === "downloaded") console.log(`重试完成：${result.displayId}`);
+      if (result.status === "downloaded") {
+        downloadedSize += result.size ?? 0;
+        console.log(`重试完成：${result.displayId}（${formatFileSize(result.size ?? 0)}）`);
+        if (hasReachedDownloadSizeLimit(downloadedSize, config.maxDownloadSizeBytes)) {
+          stoppedByLimit = true;
+          console.log(
+            `已达到本次下载体积限制：${formatFileSize(downloadedSize)} / ` +
+            `${formatFileSize(config.maxDownloadSizeBytes!)}；当前作品已完整下载，停止后续重试。`,
+          );
+          break;
+        }
+      }
       else if (result.status === "skipped") console.log(`作品已存在，跳过：${result.displayId}`);
       else {
         console.error(`重试失败：${result.displayId}：${result.error}`);
@@ -1165,7 +1240,12 @@ async function downloadWorks(workIds: number[], config: Config): Promise<Downloa
       }
     }
   }
-  return results;
+  return {
+    results,
+    downloadedSize,
+    stoppedByLimit,
+    remainingCount: uniqueIds.length - attemptedCount,
+  };
 }
 
 async function writeResults(
@@ -1247,12 +1327,22 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
     console.log("模式：download");
     console.log(`下载目录：${config.downloadDir}`);
     console.log(`待下载作品：${workIds.length} 个`);
-    const downloads = await downloadWorks(workIds, config);
+    if (config.maxDownloadSizeBytes !== undefined) {
+      console.log(`本次下载体积限制：${formatFileSize(config.maxDownloadSizeBytes)}`);
+    } else {
+      console.log("本次下载体积限制：不限制");
+    }
+    const batch = await downloadWorks(workIds, config);
+    const downloads = batch.results;
     console.log(
-      `完成：下载成功 ${downloads.filter((item) => item.status === "downloaded").length} 个，` +
+      `本次结束：下载成功 ${downloads.filter((item) => item.status === "downloaded").length} 个，` +
       `已存在 ${downloads.filter((item) => item.status === "skipped").length} 个，` +
-      `失败 ${downloads.filter((item) => item.status === "failed").length} 个。`,
+      `失败 ${downloads.filter((item) => item.status === "failed").length} 个，` +
+      `下载体积 ${formatFileSize(batch.downloadedSize)}。`,
     );
+    if (batch.stoppedByLimit && batch.remainingCount > 0) {
+      console.log(`因达到体积限制停止，队列中还有 ${batch.remainingCount} 部作品未开始。`);
+    }
     if (downloads.some((item) => item.status === "failed")) process.exitCode = 2;
     return;
   }
