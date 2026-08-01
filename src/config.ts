@@ -20,6 +20,8 @@ const DEFAULT_CONFIG: Config = {
   maxDownloadSize: "",
 };
 
+const CONFIG_FILE_KEYS = new Set(Object.keys(DEFAULT_CONFIG));
+
 export function usage(): string {
   return `用法：bun run check -- <命令> [选项]
 
@@ -100,6 +102,8 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new Error("配置文件根节点必须是 JSON 对象");
     }
+    const unknownKeys = Object.keys(parsed).filter((key) => !CONFIG_FILE_KEYS.has(key));
+    if (unknownKeys.length > 0) throw new Error(`配置文件包含未知字段：${unknownKeys.join("、")}`);
     fileConfig = parsed as Partial<Config>;
   } catch (error) {
     const code = error instanceof Error && "code" in error ? error.code : undefined;
@@ -132,6 +136,18 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
   if (!Number.isInteger(merged.maxWorkers) || merged.maxWorkers < 1 || merged.maxWorkers > 20) throw new Error("maxWorkers 必须是 1 到 20 之间的整数");
   if (!Number.isInteger(merged.maxRetries) || merged.maxRetries < 0 || merged.maxRetries > 20) throw new Error("maxRetries 必须是 0 到 20 之间的整数");
   if (typeof merged.proxyUrl !== "string") throw new Error("proxyUrl 必须是字符串");
+  const proxyUrl = merged.proxyUrl.trim();
+  if (proxyUrl) {
+    let parsedProxy: URL;
+    try {
+      parsedProxy = new URL(proxyUrl);
+    } catch {
+      throw new Error("proxyUrl 必须是有效的 HTTP 或 HTTPS 地址");
+    }
+    if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") {
+      throw new Error("proxyUrl 只支持 HTTP 或 HTTPS 地址");
+    }
+  }
   if (!Number.isFinite(merged.syncQps) || merged.syncQps <= 0 || merged.syncQps > 100) throw new Error("syncQps 必须是大于 0 且不超过 100 的数字");
   if (!Number.isFinite(merged.requestTimeoutMs) || merged.requestTimeoutMs < 1_000) throw new Error("requestTimeoutMs 必须不少于 1000 毫秒");
   if (!Number.isFinite(merged.archiveTimeoutMs) || merged.archiveTimeoutMs! < 1_000) throw new Error("archiveTimeoutMs 必须不少于 1000 毫秒");
@@ -143,7 +159,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
     archiveDir: resolvePath(configBase, merged.archiveDir),
     downloadDir: merged.downloadDir.trim() ? resolvePath(configBase, merged.downloadDir) : "",
     outputDir: resolvePath(configBase, merged.outputDir),
-    proxyUrl: merged.proxyUrl.trim(),
+    proxyUrl,
     maxDownloadSize: merged.maxDownloadSize.trim(),
     maxDownloadSizeBytes: merged.maxDownloadSize.trim() ? parseFileSize(merged.maxDownloadSize) : undefined,
     sevenZipPath: looksLikePath(merged.sevenZipPath) ? resolvePath(configBase, merged.sevenZipPath) : merged.sevenZipPath,

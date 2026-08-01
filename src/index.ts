@@ -9,6 +9,7 @@ export * from "./domain/size.ts";
 export * from "./domain/work-code.ts";
 export * from "./downloader.ts";
 export * from "./logger.ts";
+export * from "./http.ts";
 export * from "./results-store.ts";
 export type * from "./types.ts";
 

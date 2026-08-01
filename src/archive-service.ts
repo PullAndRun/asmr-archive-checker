@@ -8,53 +8,66 @@ import { errorMessage } from "./shared.ts";
 import type { CodedLocalWork, IncompleteArchive, LocalWork } from "./domain/records.ts";
 import type { Config, RequestThrottle } from "./types.ts";
 
-export async function findArchives(root: string): Promise<string[]> {
-  const found: string[] = [];
-  const pending = [root];
-  while (pending.length > 0) {
-    const directories = pending.splice(-32);
-    const batches = await Promise.all(directories.map(async (directory) => ({
-      directory,
-      entries: await readdir(directory, { withFileTypes: true }),
-    })));
-    for (const { directory, entries } of batches) {
-      for (const entry of entries) {
-        const path = join(directory, entry.name);
-        if (entry.isDirectory()) pending.push(path);
-        else if (entry.isFile() && extname(entry.name).toLowerCase() === ".7z") found.push(resolve(path));
-      }
-    }
-  }
-  return found.toSorted((left, right) => left.localeCompare(right));
-}
+type ScanDirectory = { path: string; detectWorkFolders: boolean };
+type LocalTreeScan = { archives: string[]; folders: LocalWork[] };
 
-export async function findDownloadedWorkFolders(root: string): Promise<LocalWork[]> {
-  const found: LocalWork[] = [];
-  const pending = [root];
+const isWorkFolderName = (name: string): boolean => /^(?:RJ|BJ)\d+$/i.test(name);
+
+async function scanLocalTree(
+  root: string,
+  collectArchives: boolean,
+  collectFolders: boolean,
+  allowMissingRoot: boolean,
+): Promise<LocalTreeScan> {
+  const archives: string[] = [];
+  const folders: LocalWork[] = [];
+  const pending: ScanDirectory[] = [{ path: root, detectWorkFolders: collectFolders }];
   while (pending.length > 0) {
     const directories = pending.splice(-32);
     const batches = await Promise.all(directories.map(async (directory) => {
       try {
-        return { directory, entries: await readdir(directory, { withFileTypes: true }) };
+        return { directory, entries: await readdir(directory.path, { withFileTypes: true }) };
       } catch (error) {
-        if (error instanceof Error && "code" in error && error.code === "ENOENT") return { directory, entries: [] };
+        if (allowMissingRoot && error instanceof Error && "code" in error && error.code === "ENOENT") {
+          return { directory, entries: [] };
+        }
         throw error;
       }
     }));
     for (const { directory, entries } of batches) {
       for (const entry of entries) {
-        if (!entry.isDirectory() || entry.name === ".asmr-archive-checker-downloads") continue;
-        const path = join(directory, entry.name);
-        if (/^(?:RJ|BJ)\d+$/i.test(entry.name)) {
-          const workCode = workCodeFromArchiveName(`${entry.name}.7z`);
-          if (workCode) found.push({ path: resolve(path), workCode });
-        } else {
-          pending.push(path);
+        const path = join(directory.path, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === ".asmr-archive-checker-downloads") continue;
+          if (directory.detectWorkFolders && isWorkFolderName(entry.name)) {
+            const workCode = workCodeFromArchiveName(`${entry.name}.7z`);
+            if (workCode) folders.push({ path: resolve(path), workCode });
+            if (collectArchives) pending.push({ path, detectWorkFolders: false });
+          } else {
+            pending.push({ path, detectWorkFolders: directory.detectWorkFolders });
+          }
+        } else if (collectArchives && entry.isFile() && extname(entry.name).toLowerCase() === ".7z") {
+          archives.push(resolve(path));
         }
       }
     }
   }
-  return found.toSorted((left, right) => left.path.localeCompare(right.path));
+  return {
+    archives: archives.toSorted((left, right) => left.localeCompare(right)),
+    folders: folders.toSorted((left, right) => left.path.localeCompare(right.path)),
+  };
+}
+
+export async function scanLocalCollection(root: string): Promise<LocalTreeScan> {
+  return scanLocalTree(root, true, true, false);
+}
+
+export async function findArchives(root: string): Promise<string[]> {
+  return (await scanLocalTree(root, true, false, false)).archives;
+}
+
+export async function findDownloadedWorkFolders(root: string): Promise<LocalWork[]> {
+  return (await scanLocalTree(root, false, true, true)).folders;
 }
 
 export function classifyArchives(paths: string[]): { recognized: CodedLocalWork[]; unknown: string[] } {
@@ -120,15 +133,14 @@ export async function checkArchive(
   workCode: WorkCode,
   config: Config,
   knownWorkId?: number,
-  proxyUrl = "",
   throttle?: RequestThrottle,
 ): Promise<IncompleteArchive | undefined> {
   let workId = knownWorkId;
   try {
-    if (workId === undefined) workId = (await fetchWorkByCode(workCode, config, proxyUrl, throttle)).id;
+    if (workId === undefined) workId = (await fetchWorkByCode(workCode, config, throttle)).id;
     const [archiveResult, trackResult] = await Promise.allSettled([
       listArchive(archivePath, config.sevenZipPath, config.archiveTimeoutMs),
-      fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config.requestTimeoutMs, 4, proxyUrl, throttle),
+      fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config, throttle),
     ]);
     if (archiveResult.status === "rejected" || trackResult.status === "rejected") {
       const failures = [archiveResult, trackResult]

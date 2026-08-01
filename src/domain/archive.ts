@@ -20,7 +20,26 @@ export type DownloadFile = {
   size?: number;
 };
 
-const MAX_PATH_SEGMENT_LENGTH = 180;
+const MAX_PATH_SEGMENT_BYTES = 180;
+const textEncoder = new TextEncoder();
+
+const utf8Length = (value: string): number => textEncoder.encode(value).byteLength;
+const utf8RuneLength = (rune: string): number => {
+  const codePoint = rune.codePointAt(0) ?? 0;
+  return codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+};
+
+const truncateUtf8 = (value: string, maximumBytes: number): string => {
+  let result = "";
+  let bytes = 0;
+  for (const rune of value) {
+    const runeBytes = utf8RuneLength(rune);
+    if (bytes + runeBytes > maximumBytes) break;
+    result += rune;
+    bytes += runeBytes;
+  }
+  return result;
+};
 
 type ParentPath = { value: string; parent?: ParentPath };
 
@@ -90,16 +109,14 @@ export function sanitizeDownloadPathSegment(value: string): string {
   const stem = sanitized.split(".", 1)[0];
   if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) sanitized = `_${sanitized}`;
 
-  const runes = [...sanitized];
-  if (runes.length > MAX_PATH_SEGMENT_LENGTH) {
+  if (utf8Length(sanitized) > MAX_PATH_SEGMENT_BYTES) {
     const extension = extname(sanitized);
-    const extensionRunes = [...extension];
-    if (extensionRunes.length >= MAX_PATH_SEGMENT_LENGTH) {
-      sanitized = runes.slice(0, MAX_PATH_SEGMENT_LENGTH).join("").replace(/[ .]+$/g, "");
+    const extensionLength = utf8Length(extension);
+    if (extensionLength >= MAX_PATH_SEGMENT_BYTES) {
+      sanitized = truncateUtf8(sanitized, MAX_PATH_SEGMENT_BYTES).replace(/[ .]+$/g, "");
     } else {
       const name = basename(sanitized, extension);
-      const keep = Math.max(1, MAX_PATH_SEGMENT_LENGTH - extensionRunes.length);
-      sanitized = `${[...name].slice(0, keep).join("")}${extension}`;
+      sanitized = `${truncateUtf8(name, MAX_PATH_SEGMENT_BYTES - extensionLength)}${extension}`;
     }
   }
   return sanitized;
@@ -118,11 +135,10 @@ function addCollisionSuffix(path: string, sequence: number): string {
   const extension = extname(path);
   const name = basename(path, extension);
   const suffix = ` (${sequence})`;
-  const suffixLength = [...suffix].length;
-  const extensionRunes = [...extension];
-  const keptExtension = extensionRunes.slice(0, Math.max(0, MAX_PATH_SEGMENT_LENGTH - suffixLength - 1)).join("");
-  const nameLength = Math.max(1, MAX_PATH_SEGMENT_LENGTH - suffixLength - [...keptExtension].length);
-  const suffixed = `${[...name].slice(0, nameLength).join("")}${suffix}${keptExtension}`;
+  const suffixLength = utf8Length(suffix);
+  const keptExtension = truncateUtf8(extension, Math.max(0, MAX_PATH_SEGMENT_BYTES - suffixLength - 1));
+  const nameLength = Math.max(1, MAX_PATH_SEGMENT_BYTES - suffixLength - utf8Length(keptExtension));
+  const suffixed = `${truncateUtf8(name, nameLength)}${suffix}${keptExtension}`;
   return directory === "." ? suffixed : join(directory, suffixed);
 }
 

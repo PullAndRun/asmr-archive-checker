@@ -1,6 +1,6 @@
 import { basename, join } from "node:path";
 import { createRequestThrottle, fetchAllWorks, workCodeFromSearchWork } from "./api.ts";
-import { checkArchive, classifyArchives, findArchives, findDownloadedWorkFolders } from "./archive-service.ts";
+import { checkArchive, classifyArchives, findArchives, findDownloadedWorkFolders, scanLocalCollection } from "./archive-service.ts";
 import { ensureDirectory, loadConfig, parseArgs, requireDirectory, usage, validateOutputDirectory } from "./config.ts";
 import {
   DELETE_QUEUE_FILE_NAME,
@@ -22,17 +22,18 @@ import {
 } from "./results-store.ts";
 import { mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
+import type { Config } from "./types.ts";
 
-const runDelete = async (outputDir: string, archiveDir: string, config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> => {
-  await requireDirectory(archiveDir, "archiveDir");
-  await requireDirectory(outputDir, "outputDir");
+const runDelete = async (config: Config): Promise<void> => {
+  await requireDirectory(config.archiveDir, "archiveDir");
+  await requireDirectory(config.outputDir, "outputDir");
   logger.info("模式：delete");
-  logger.info(`读取检查结果：${join(outputDir, DELETE_QUEUE_FILE_NAME)}`);
-  await previewAndDeleteIncomplete(await readDeletionQueue(outputDir), config);
-  logger.info(`结果目录：${outputDir}`);
+  logger.info(`读取检查结果：${join(config.outputDir, DELETE_QUEUE_FILE_NAME)}`);
+  await previewAndDeleteIncomplete(await readDeletionQueue(config.outputDir), config);
+  logger.info(`结果目录：${config.outputDir}`);
 };
 
-const runDeleteNonAuthor = async (config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> => {
+const runDeleteNonAuthor = async (config: Config): Promise<void> => {
   await requireDirectory(config.archiveDir, "archiveDir");
   await requireDirectory(config.outputDir, "outputDir");
   logger.info("模式：delete-non-author");
@@ -41,7 +42,7 @@ const runDeleteNonAuthor = async (config: Awaited<ReturnType<typeof loadConfig>>
   logger.info(`结果清单保留在：${join(config.outputDir, NON_AUTHOR_FILE_NAME)}`);
 };
 
-const runDownload = async (config: Awaited<ReturnType<typeof loadConfig>>): Promise<void> => {
+const runDownload = async (config: Config): Promise<void> => {
   validateOutputDirectory(config);
   await ensureDirectory(config.outputDir, "outputDir");
   const snapshot = await readOutputSnapshot(config.outputDir);
@@ -53,7 +54,6 @@ const runDownload = async (config: Awaited<ReturnType<typeof loadConfig>>): Prom
   const targets = await resolveDownloadTargets(
     workCodes,
     config,
-    config.proxyUrl,
     createRequestThrottle(config.syncQps),
   );
   await replaceOutputDirectory(config.outputDir, (stagingDir) => restoreOutputSnapshot(stagingDir, snapshot));
@@ -75,7 +75,7 @@ const runDownload = async (config: Awaited<ReturnType<typeof loadConfig>>): Prom
 
 const runCheck = async (
   mode: "author" | "archives",
-  config: Awaited<ReturnType<typeof loadConfig>>,
+  config: Config,
 ): Promise<void> => {
   await requireDirectory(config.archiveDir, "archiveDir");
   validateOutputDirectory(config);
@@ -83,18 +83,23 @@ const runCheck = async (
   if (mode === "author") logger.info(`作者：${config.author}`);
   logger.info(`7z 目录：${config.archiveDir}`);
 
-  const folderRoots = mode === "author"
-    ? [...new Set([config.archiveDir, config.downloadDir].filter(Boolean))]
+  const extraFolderRoots = mode === "author"
+    ? [...new Set([config.downloadDir].filter((root) => root && root !== config.archiveDir))]
     : [];
-  const [archivePaths, downloadedFolderGroups] = await Promise.all([
-    findArchives(config.archiveDir),
-    Promise.all(folderRoots.map(findDownloadedWorkFolders)),
+  const [localCollection, extraFolderGroups] = await Promise.all([
+    mode === "author"
+      ? scanLocalCollection(config.archiveDir)
+      : findArchives(config.archiveDir).then((archives) => ({ archives, folders: [] })),
+    Promise.all(extraFolderRoots.map(findDownloadedWorkFolders)),
   ]);
-  const downloadedFolders = [...new Map(downloadedFolderGroups.flat().map((folder) => [folder.path, folder])).values()];
+  const archivePaths = localCollection.archives;
+  const downloadedFolders = [...new Map(
+    [localCollection.folders, ...extraFolderGroups].flat().map((folder) => [folder.path, folder]),
+  ).values()];
   const { recognized: recognizedArchives, unknown: unknownArchives } = classifyArchives(archivePaths);
   const apiThrottle = createRequestThrottle(config.syncQps);
   logger.info(`API 请求速率：每秒最多 ${config.syncQps} 次`);
-  const works = mode === "author" ? await fetchAllWorks(config, config.proxyUrl, apiThrottle) : [];
+  const works = mode === "author" ? await fetchAllWorks(config, apiThrottle) : [];
   const websiteWorks = new Map(works.map((work) => [workCodeFromSearchWork(work), work]));
   const websiteCodes = new Set(websiteWorks.keys());
   const archivesToCheck: CodedLocalWork[] = mode === "author"
@@ -117,7 +122,6 @@ const runCheck = async (
       archive.workCode,
       config,
       archive.workId,
-      config.proxyUrl,
       apiThrottle,
     );
   });
@@ -150,7 +154,7 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
   const cli = parseArgs(args);
   if (cli.help) return void logger.info(usage());
   const config = await loadConfig(cli);
-  if (cli.mode === "delete") return runDelete(config.outputDir, config.archiveDir, config);
+  if (cli.mode === "delete") return runDelete(config);
   if (cli.mode === "delete-non-author") return runDeleteNonAuthor(config);
   if (cli.mode === "download") return runDownload(config);
   return runCheck(cli.mode, config);

@@ -19,11 +19,14 @@ import {
   findNonAuthorWorks,
   findArchives,
   findDownloadedWorkFolders,
+  fetchJson,
   flattenTrackTree,
   formatFileSize,
   formatWorkId,
   hasReachedDownloadSizeLimit,
   isCompleteDownloadFile,
+  httpErrorFromResponse,
+  isRetryableRequestError,
   loadConfig,
   parseArgs,
   parseDeletionQueue,
@@ -33,6 +36,8 @@ import {
   parseSevenZipListing,
   prepareStagingPath,
   replaceOutputDirectory,
+  retryAfterMilliseconds,
+  scanLocalCollection,
   sanitizeDownloadPathSegment,
   normalizeWorkCode,
   workCodeFromArchiveName,
@@ -74,6 +79,12 @@ describe("下载器调用", () => {
     ]);
     expect(files[0].relativePath).not.toBe(files[1].relativePath);
     expect(files.every((file) => [...file.relativePath].length <= 180)).toBeTrue();
+  });
+
+  test("多字节文件名按 UTF-8 字节限制并保留扩展名", () => {
+    const sanitized = sanitizeDownloadPathSegment(`${"音".repeat(200)}.wav`);
+    expect(new TextEncoder().encode(sanitized).byteLength).toBeLessThanOrEqual(180);
+    expect(sanitized.endsWith(".wav")).toBeTrue();
   });
 
   test("保留所有音频格式和非音频资源", () => {
@@ -142,6 +153,20 @@ describe("下载器调用", () => {
       }));
       await writeResponseBodyToFile(response, path, controller, 1_000);
       expect([...new Uint8Array(await Bun.file(path).arrayBuffer())]).toEqual([1, 2, 3, 4, 5]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("响应数据超过预期大小时立即中止写入", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-checker-stream-limit-test-"));
+    try {
+      const path = join(root, "response.bin");
+      const controller = new AbortController();
+      const response = new Response(new Uint8Array([1, 2, 3, 4]));
+      await expect(writeResponseBodyToFile(response, path, controller, 1_000, 3)).rejects.toThrow("超过预期大小");
+      expect(controller.signal.aborted).toBeTrue();
+      expect((await Bun.file(path).stat()).size).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -412,7 +437,9 @@ describe("配置与结果目录", () => {
       await expect(load({ maxWorkers: 0 })).rejects.toThrow("maxWorkers");
       await expect(load({ maxRetries: -1 })).rejects.toThrow("maxRetries");
       await expect(load({ proxyUrl: 123 })).rejects.toThrow("proxyUrl");
+      await expect(load({ proxyUrl: "socks5://127.0.0.1:1080" })).rejects.toThrow("只支持 HTTP 或 HTTPS");
       await expect(load({ syncQps: 0 })).rejects.toThrow("syncQps");
+      await expect(load({ maxWokers: 4 })).rejects.toThrow("未知字段：maxWokers");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -456,6 +483,10 @@ describe("本地目录扫描", () => {
         path: resolve(workFolder),
         workCode: "RJ01000000",
       }]);
+      expect(await scanLocalCollection(root)).toEqual({
+        archives: [resolve(archivePath)],
+        folders: [{ path: resolve(workFolder), workCode: "RJ01000000" }],
+      });
       expect(await findDownloadedWorkFolders(join(root, "missing"))).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -566,6 +597,42 @@ describe("API 请求", () => {
   test("拒绝无效的请求速率", () => {
     expect(() => createRequestThrottle(0)).toThrow("必须是正数");
     expect(() => createRequestThrottle(Number.NaN)).toThrow("必须是正数");
+  });
+
+  test("只重试临时 HTTP 错误并遵循 Retry-After", async () => {
+    let notFoundRequests = 0;
+    let retryRequests = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === "/not-found") {
+          notFoundRequests += 1;
+          return new Response("missing", { status: 404 });
+        }
+        retryRequests += 1;
+        return retryRequests === 1
+          ? new Response("busy", { status: 503, headers: { "Retry-After": "0" } })
+          : Response.json({ ok: true });
+      },
+    });
+    const config = { requestTimeoutMs: 1_000, maxRetries: 3, proxyUrl: "" };
+    try {
+      await expect(fetchJson(`${server.url}not-found`, config)).rejects.toThrow("HTTP 404");
+      expect(notFoundRequests).toBe(1);
+      expect(await fetchJson<{ ok: boolean }>(`${server.url}retry`, config)).toEqual({ ok: true });
+      expect(retryRequests).toBe(2);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("解析 Retry-After 并区分永久 HTTP 错误", () => {
+    expect(retryAfterMilliseconds("1.5")).toBe(1_500);
+    expect(retryAfterMilliseconds("999")).toBe(60_000);
+    expect(isRetryableRequestError(httpErrorFromResponse(new Response(null, { status: 404 })))).toBeFalse();
+    expect(isRetryableRequestError(httpErrorFromResponse(new Response(null, { status: 429 })))).toBeTrue();
   });
 });
 

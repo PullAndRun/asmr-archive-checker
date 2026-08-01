@@ -59,10 +59,10 @@ Copy-Item config.example.json config.json
 - `maxDownloadSize`：单次运行允许完成下载的最大总体积，例如 `"100 GB"`。支持 B、KB、MB、GB、TB（按 1024 换算）；设为 `""` 表示不限制；
 - `concurrency`：API 和压缩包检查的并发数，范围 1–20；
 - `maxWorkers`：同一部作品内同时下载的最大文件数，范围 1–20；
-- `maxRetries`：单个文件下载失败后的最大重试次数，范围 0–20；
+- `maxRetries`：API 或单个文件请求失败后的最大重试次数，范围 0–20；
 - `proxyUrl`：API 和文件下载使用的代理地址；设为 `""` 表示不使用代理；
 - `syncQps`：API 请求速率上限，范围大于 0 且不超过 100；
-- `requestTimeoutMs`：单次 API 请求超时毫秒数。
+- `requestTimeoutMs`：API 请求以及文件下载连接/无数据等待的超时毫秒数。
 - `archiveTimeoutMs`：单个压缩包执行 7-Zip 列表检查的超时毫秒数，默认 300000（5 分钟）。
 
 相对路径均以配置文件所在目录为基准。

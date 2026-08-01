@@ -1,30 +1,9 @@
 import { API_BASE_URL, SEARCH_PAGE_SIZE } from "./constants.ts";
 import { formatWorkId, normalizeWorkCode, workCodeFromMetadata, type WorkCode } from "./domain/work-code.ts";
+import { httpErrorFromResponse, isRetryableRequestError, retryDelayMilliseconds } from "./http.ts";
 import { errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type { Config, RequestThrottle, SearchResponse, SearchWork } from "./types.ts";
-
-type HttpError = Error & { status: number; retryAfterMs?: number };
-
-const retryAfterMilliseconds = (value: string | null): number | undefined => {
-  if (!value) return undefined;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 60_000);
-  const date = Date.parse(value);
-  return Number.isFinite(date) ? Math.min(Math.max(0, date - Date.now()), 60_000) : undefined;
-};
-
-const httpError = (response: Response): HttpError =>
-  Object.assign(new Error(`HTTP ${response.status} ${response.statusText}`), {
-    status: response.status,
-    retryAfterMs: retryAfterMilliseconds(response.headers.get("retry-after")),
-  });
-
-const isHttpError = (error: unknown): error is HttpError =>
-  error instanceof Error && "status" in error && typeof error.status === "number";
-
-const isRetryable = (error: unknown): boolean =>
-  !isHttpError(error) || error.status === 408 || error.status === 429 || error.status >= 500;
 
 export function buildSearchUrl(author: string, page: number, pageSize = SEARCH_PAGE_SIZE): string {
   if (!Number.isSafeInteger(page) || page < 1) throw new Error(`搜索页码必须是正整数，实际为 ${page}`);
@@ -59,35 +38,43 @@ export function buildWorkSearchUrl(id: number | string): string {
 
 export async function fetchJson<T>(
   url: string,
-  timeoutMs: number,
-  attempts = 4,
-  proxyUrl = "",
+  config: Pick<Config, "requestTimeoutMs" | "maxRetries" | "proxyUrl">,
   throttle?: RequestThrottle,
 ): Promise<T> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error(`请求超时必须是正数，实际为 ${timeoutMs}`);
-  if (!Number.isInteger(attempts) || attempts < 1) throw new Error(`请求次数必须是正整数，实际为 ${attempts}`);
+  if (!Number.isFinite(config.requestTimeoutMs) || config.requestTimeoutMs <= 0) {
+    throw new Error(`请求超时必须是正数，实际为 ${config.requestTimeoutMs}`);
+  }
+  if (!Number.isInteger(config.maxRetries) || config.maxRetries < 0 || config.maxRetries > 20) {
+    throw new Error(`最大重试次数必须是 0 到 20 之间的整数，实际为 ${config.maxRetries}`);
+  }
+  const attempts = config.maxRetries + 1;
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     if (throttle) await throttle();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, config.requestTimeoutMs);
     try {
       const response = await fetch(url, {
         headers: { Accept: "application/json", "User-Agent": "asmr-archive-checker/1.0" },
         signal: controller.signal,
-        ...(proxyUrl ? { proxy: proxyUrl } : {}),
+        ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
       });
-      if (!response.ok) throw httpError(response);
+      if (!response.ok) throw httpErrorFromResponse(response);
       return (await response.json()) as T;
     } catch (error) {
-      lastError = error;
-      if (attempt < attempts && isRetryable(error)) {
-        const delayMs = isHttpError(error) && error.retryAfterMs !== undefined
-          ? error.retryAfterMs
-          : Math.min(500 * 2 ** (attempt - 1), 8_000);
-        logger.warn(`API 请求失败（${attempt}/${attempts}）：${errorMessage(error)}；${delayMs} 毫秒后重试`);
+      const requestError = timedOut ? new Error(`请求超过 ${config.requestTimeoutMs} 毫秒未完成`) : error;
+      lastError = requestError;
+      clearTimeout(timer);
+      controller.abort();
+      if (attempt < attempts && isRetryableRequestError(requestError)) {
+        const delayMs = retryDelayMilliseconds(requestError, attempt);
+        logger.warn(`API 请求失败（${attempt}/${attempts}）：${errorMessage(requestError)}；${delayMs} 毫秒后重试`);
         await Bun.sleep(delayMs);
-      } else if (!isRetryable(error)) {
+      } else if (!isRetryableRequestError(requestError)) {
         break;
       }
     } finally {
@@ -128,19 +115,24 @@ export function validateSearchResponse(value: unknown): asserts value is SearchR
 
 export async function fetchAllWorks(
   config: Config,
-  proxyUrl = "",
   throttle?: RequestThrottle,
 ): Promise<SearchWork[]> {
-  logger.info(`正在读取作者作品列表${proxyUrl ? "（使用代理）" : ""}...`);
-  const first = await fetchJson<SearchResponse>(buildSearchUrl(config.author, 1), config.requestTimeoutMs, 4, proxyUrl, throttle);
+  logger.info(`正在读取作者作品列表${config.proxyUrl ? "（使用代理）" : ""}...`);
+  const first = await fetchJson<SearchResponse>(buildSearchUrl(config.author, 1), config, throttle);
   validateSearchResponse(first);
+  if (first.pagination.currentPage !== 1) {
+    throw new Error(`作品列表 API 返回了错误页码：请求 1，返回 ${first.pagination.currentPage}`);
+  }
   const totalPages = Math.max(1, Math.ceil(first.pagination.totalCount / first.pagination.pageSize));
   if (totalPages > 100_000) throw new Error(`作品列表 API 返回的分页数量异常：${totalPages}`);
   const pages = Array.from({ length: totalPages - 1 }, (_, index) => index + 2);
   const responses = await mapLimit(pages, config.concurrency, async (page) => {
     logger.info(`正在读取作者作品列表：${page}/${totalPages}`);
-    const response = await fetchJson<SearchResponse>(buildSearchUrl(config.author, page), config.requestTimeoutMs, 4, proxyUrl, throttle);
+    const response = await fetchJson<SearchResponse>(buildSearchUrl(config.author, page), config, throttle);
     validateSearchResponse(response);
+    if (response.pagination.currentPage !== page) {
+      throw new Error(`作品列表 API 返回了错误页码：请求 ${page}，返回 ${response.pagination.currentPage}`);
+    }
     return response.works;
   });
   return [...new Map([first.works, ...responses].flat()
@@ -151,10 +143,9 @@ export async function fetchAllWorks(
 export async function fetchWorkByCode(
   workCode: string,
   config: Config,
-  proxyUrl = "",
   throttle?: RequestThrottle,
 ): Promise<SearchWork> {
-  const response = await fetchJson<SearchResponse>(buildWorkSearchUrl(workCode), config.requestTimeoutMs, 4, proxyUrl, throttle);
+  const response = await fetchJson<SearchResponse>(buildWorkSearchUrl(workCode), config, throttle);
   validateSearchResponse(response);
   const normalizedCode = normalizeWorkCode(workCode);
   const work = response.works.find((candidate) => workCodeFromSearchWork(candidate) === normalizedCode);

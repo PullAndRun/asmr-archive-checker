@@ -6,6 +6,7 @@ import { buildDownloadFilePlan, type DownloadFile, type TrackNode } from "./doma
 import { formatFileSize, hasReachedDownloadSizeLimit } from "./domain/size.ts";
 import { formatWorkId } from "./domain/work-code.ts";
 import { directorySize, pathExists } from "./fs-utils.ts";
+import { httpErrorFromResponse, isRetryableRequestError, retryDelayMilliseconds } from "./http.ts";
 import { containsPath, errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type {
@@ -49,10 +50,14 @@ export async function writeResponseBodyToFile(
   path: string,
   controller: AbortController,
   inactivityTimeoutMs: number,
+  expectedSize?: number,
 ): Promise<void> {
   if (!response.body) throw new Error("下载响应没有文件内容");
   if (!Number.isFinite(inactivityTimeoutMs) || inactivityTimeoutMs <= 0) {
     throw new Error(`下载无数据超时必须是正数，实际为 ${inactivityTimeoutMs}`);
+  }
+  if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
+    throw new Error(`预期下载大小无效：${expectedSize}`);
   }
   // Exclusive creation prevents a concurrently inserted symlink from being followed.
   const file = await open(path, "wx", 0o600);
@@ -75,6 +80,14 @@ export async function writeResponseBodyToFile(
       if (chunk.done) {
         completed = true;
         break;
+      }
+      if (!Number.isSafeInteger(position + chunk.value.byteLength)) {
+        controller.abort();
+        throw new Error("下载文件大小超过安全整数范围");
+      }
+      if (expectedSize !== undefined && position + chunk.value.byteLength > expectedSize) {
+        controller.abort();
+        throw new Error(`下载数据超过预期大小 ${expectedSize}`);
       }
       let offset = 0;
       while (offset < chunk.value.byteLength) {
@@ -116,13 +129,13 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let connectionTimedOut = false;
     try {
-      if (attempt > 0) {
-        logger.warn(`重试 ${attempt}/${config.maxRetries}：${file.relativePath}（${errorMessage(lastError)}）`);
-        await Bun.sleep(Math.min(500 * 2 ** (attempt - 1), 4_000));
-      }
       await rm(partialPath, { force: true });
-      timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+      timer = setTimeout(() => {
+        connectionTimedOut = true;
+        controller.abort();
+      }, config.requestTimeoutMs);
       const response = await fetch(file.url, {
         headers: { "User-Agent": "asmr-archive-checker/1.0" },
         signal: controller.signal,
@@ -130,7 +143,7 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
       });
       clearTimeout(timer);
       timer = undefined;
-      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      if (!response.ok) throw httpErrorFromResponse(response);
       const lengthHeader = response.headers.has("content-encoding") ? null : response.headers.get("content-length");
       const responseSize = lengthHeader && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : undefined;
       if (responseSize !== undefined && (!Number.isSafeInteger(responseSize) || responseSize < 0)) {
@@ -139,8 +152,8 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
       if (file.size !== undefined && responseSize !== undefined && file.size !== responseSize) {
         throw new Error(`响应文件大小不符：预期 ${file.size}，响应声明 ${responseSize}`);
       }
-      await writeResponseBodyToFile(response, partialPath, controller, config.requestTimeoutMs);
       const expectedSize = file.size ?? responseSize;
+      await writeResponseBodyToFile(response, partialPath, controller, config.requestTimeoutMs, expectedSize);
       if (expectedSize !== undefined) {
         const actualSize = (await stat(partialPath)).size;
         if (actualSize !== expectedSize) {
@@ -151,7 +164,22 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
       await rename(partialPath, targetPath);
       return "downloaded";
     } catch (error) {
-      lastError = error;
+      const requestError = connectionTimedOut
+        ? new Error(`下载连接超过 ${config.requestTimeoutMs} 毫秒未响应`)
+        : error;
+      lastError = requestError;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      controller.abort();
+      if (attempt < config.maxRetries && isRetryableRequestError(requestError)) {
+        const delayMs = retryDelayMilliseconds(requestError, attempt + 1, 4_000);
+        logger.warn(`下载失败（${attempt + 1}/${config.maxRetries + 1}）：${file.relativePath}（${errorMessage(requestError)}）；${delayMs} 毫秒后重试`);
+        await Bun.sleep(delayMs);
+      } else if (!isRetryableRequestError(requestError)) {
+        break;
+      }
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       controller.abort();
@@ -190,22 +218,25 @@ const downloadWithBuiltin = async (
   stagingPath: string,
   config: Config,
 ): Promise<void> => {
-  const trackTree = await fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config.requestTimeoutMs, 4, config.proxyUrl);
+  const trackTree = await fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config);
   if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
   const files = buildDownloadFilePlan(trackTree);
   if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
   logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${config.maxWorkers}`);
-  let finished = 0;
+  let processed = 0;
   let reused = 0;
   const errors = await mapLimit(files, config.maxWorkers, async (file) => {
     try {
       const status = await downloadFile(file, stagingPath, config);
-      finished += 1;
       if (status === "skipped") reused += 1;
-      logger.info(`[${finished}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);
+      processed += 1;
+      logger.info(`[${processed}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);
       return undefined;
     } catch (error) {
-      return errorMessage(error);
+      const message = errorMessage(error);
+      processed += 1;
+      logger.warn(`[${processed}/${files.length}] 失败 ${file.relativePath}：${message}`);
+      return message;
     }
   });
   const failures = errors.filter((error): error is string => typeof error === "string");
@@ -343,13 +374,12 @@ export async function downloadWorks(
 export async function resolveDownloadTargets(
   workCodes: Array<number | string>,
   config: Config,
-  proxyUrl = "",
   throttle?: RequestThrottle,
 ): Promise<DownloadTarget[]> {
   return mapLimit(workCodes, config.concurrency, async (input) => {
     const workCode = typeof input === "number" ? formatWorkId(input) : input;
     if (workCode.startsWith("RJ")) return { workId: Number(workCode.slice(2)), displayId: workCode };
-    const work = await fetchWorkByCode(workCode, config, proxyUrl, throttle);
+    const work = await fetchWorkByCode(workCode, config, throttle);
     return { workId: work.id, displayId: workCodeFromSearchWork(work) };
   }).then((targets) => [...new Map(targets.map((target) => [target.displayId, target])).values()]);
 }
