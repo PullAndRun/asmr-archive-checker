@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   buildDownloadFilePlan,
   buildDeletionPlan,
@@ -16,22 +16,30 @@ import {
   buildNonAuthorWorkList,
   findMissingFiles,
   findNonAuthorWorks,
+  findArchives,
+  findDownloadedWorkFolders,
   flattenTrackTree,
   formatFileSize,
   formatWorkId,
   hasReachedDownloadSizeLimit,
   isCompleteDownloadFile,
+  loadConfig,
   parseArgs,
   parseDeletionQueue,
   parseDownloadQueue,
   parseFileSize,
   parseNonAuthorWorkList,
   parseSevenZipListing,
-  prepareBuiltinStagingPath,
+  prepareStagingPath,
+  replaceOutputDirectory,
   sanitizeDownloadPathSegment,
+  normalizeWorkCode,
+  workCodeFromArchiveName,
+  workCodeFromSearchWork,
   workIdFromArchiveName,
   writeResponseBodyToFile,
 } from "../src/index.ts";
+import { mapLimit } from "../src/shared.ts";
 
 describe("下载器调用", () => {
   test("清理 Windows 非法文件名和保留扩展名", () => {
@@ -56,13 +64,23 @@ describe("下载器调用", () => {
     ]);
   });
 
-  test("遵循 asmroner 的媒体格式偏好并保留非音频文件", () => {
+  test("超长文件名发生冲突时仍保持组件长度上限", () => {
+    const title = `${"a".repeat(250)}.wav`;
+    const files = buildDownloadFilePlan([
+      { type: "audio", title, mediaDownloadUrl: "https://example.com/1" },
+      { type: "audio", title, mediaDownloadUrl: "https://example.com/2" },
+    ]);
+    expect(files[0].relativePath).not.toBe(files[1].relativePath);
+    expect(files.every((file) => [...file.relativePath].length <= 180)).toBeTrue();
+  });
+
+  test("保留所有音频格式和非音频资源", () => {
     const files = buildDownloadFilePlan([
       { type: "audio", title: "声音.wav", mediaDownloadUrl: "https://example.com/wav" },
       { type: "audio", title: "声音.mp3", mediaDownloadUrl: "https://example.com/mp3" },
       { type: "image", title: "封面.jpg", mediaDownloadUrl: "https://example.com/jpg" },
-    ], "mp3>wav>flac");
-    expect(files.map((file) => file.relativePath)).toEqual(["声音.mp3", "封面.jpg"]);
+    ]);
+    expect(files.map((file) => file.relativePath)).toEqual(["声音.wav", "声音.mp3", "封面.jpg"]);
   });
 
   test("只复用大小完整的已下载文件", () => {
@@ -82,10 +100,10 @@ describe("下载器调用", () => {
         Bun.write(join(larger, "file.txt"), "larger old download"),
       ]);
 
-      const selected = await prepareBuiltinStagingPath(root, "RJ01000000");
+      const selected = await prepareStagingPath(root, "RJ01000000");
       expect(selected).toBe(join(root, "RJ01000000"));
       expect(await Bun.file(join(selected, "file.txt")).text()).toBe("larger old download");
-      expect(await prepareBuiltinStagingPath(root, "RJ01000000")).toBe(selected);
+      expect(await prepareStagingPath(root, "RJ01000000")).toBe(selected);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -120,26 +138,33 @@ describe("编号识别", () => {
     expect(workIdFromArchiveName("no-id.7z")).toBeUndefined();
     expect(formatWorkId(123)).toBe("RJ123");
   });
+
+  test("识别 BJ 来源编号而不把 API 内部 ID 伪装成 RJ", () => {
+    expect(normalizeWorkCode("bj0633449")).toBe("BJ633449");
+    expect(workCodeFromArchiveName("作品-BJ633449.7z")).toBe("BJ633449");
+    expect(workIdFromArchiveName("BJ633449.7z")).toBeUndefined();
+    expect(workCodeFromSearchWork({ id: 100000007, source_id: "BJ633449" })).toBe("BJ633449");
+  });
 });
 
 describe("非该作者作品清单", () => {
   test("列出作者作品集合之外的压缩包和文件夹", () => {
     const works = findNonAuthorWorks(
-      [1602072, 1616933],
+      ["RJ01602072", "RJ01616933"],
       [
-        { path: "D:/voice/RJ01602072.7z", workId: 1602072 },
-        { path: "D:/voice/RJ02000000.7z", workId: 2000000 },
+        { path: "D:/voice/RJ01602072.7z", workCode: "RJ01602072" },
+        { path: "D:/voice/RJ02000000.7z", workCode: "RJ02000000" },
       ],
       [
-        { path: "D:/download/RJ02000000", workId: 2000000 },
-        { path: "D:/download/RJ03000000", workId: 3000000 },
+        { path: "D:/download/RJ02000000", workCode: "RJ02000000" },
+        { path: "D:/download/RJ03000000", workCode: "RJ03000000" },
       ],
     );
 
     expect(works).toEqual([
-      { path: "D:/voice/RJ02000000.7z", workId: 2000000, type: "压缩包" },
-      { path: "D:/download/RJ02000000", workId: 2000000, type: "文件夹" },
-      { path: "D:/download/RJ03000000", workId: 3000000, type: "文件夹" },
+      { path: "D:/voice/RJ02000000.7z", workCode: "RJ02000000", type: "压缩包" },
+      { path: "D:/download/RJ02000000", workCode: "RJ02000000", type: "文件夹" },
+      { path: "D:/download/RJ03000000", workCode: "RJ03000000", type: "文件夹" },
     ]);
     expect(buildNonAuthorWorkList(works)).toBe([
       "作品ID\t类型\t路径",
@@ -174,6 +199,7 @@ describe("API 路径", () => {
     expect(formatWorkId(1000000)).toBe("RJ01000000");
     expect(formatWorkId(1602072)).toBe("RJ01602072");
     expect(formatWorkId(1616933)).toBe("RJ01616933");
+    expect(decodeURIComponent(new URL(buildWorkSearchUrl("BJ633449")).pathname)).toBe("/api/search/BJ633449");
   });
 });
 
@@ -200,6 +226,21 @@ describe("文件树和 7z 清单", () => {
       "目录/缺少.txt",
     ]);
     expect(findMissingFiles(entries, ["甲/说明.png", "乙/说明.png"], 1602072)).toEqual(["乙/说明.png"]);
+  });
+
+  test("迭代展开极深文件树而不耗尽调用栈", () => {
+    let node: Parameters<typeof flattenTrackTree>[0][number] = {
+      type: "audio",
+      title: "声音.wav",
+      mediaDownloadUrl: "https://example.com/audio",
+    };
+    for (let depth = 0; depth < 12_000; depth += 1) {
+      node = { type: "folder", title: "层", children: [node] };
+    }
+    const paths = flattenTrackTree([node]);
+    expect(paths).toHaveLength(1);
+    expect(paths[0].endsWith("声音.wav")).toBeTrue();
+    expect(buildDownloadFilePlan([node])).toHaveLength(1);
   });
 });
 
@@ -233,8 +274,14 @@ describe("命令行参数", () => {
       "RJ01602072\t不完整\tD:/RJ01602072.7z",
       "RJ01602072\t遗漏\t标题",
       "RJ01616933\t遗漏\t标题二",
+      "BJ633449\t遗漏\t标题三",
       "",
-    ].join("\n"))).toEqual([1602072, 1616933]);
+    ].join("\n"))).toEqual([1602072, 1616933, "BJ633449"]);
+  });
+
+  test("拒绝空白或损坏的待下载汇总", () => {
+    expect(() => parseDownloadQueue("")).toThrow("格式无效");
+    expect(() => parseDownloadQueue("作品ID\t原因\t来源\nRJ1\n")).toThrow("无效记录");
   });
 
   test("读取 author 和 archives 生成的待删除清单", () => {
@@ -244,6 +291,7 @@ describe("命令行参数", () => {
       "",
     ].join("\n"))).toEqual([{
       archivePath: "D:/voice/RJ01602072.7z",
+      workCode: "RJ01602072",
       workId: 1602072,
       missingFiles: ["来自检查结果"],
     }]);
@@ -269,6 +317,84 @@ describe("命令行参数", () => {
       "RJ328352\tD:/voice/RJ328352.7z",
       "",
     ].join("\n"));
+  });
+
+  test("BJ 编号在删除清单中保持来源编号", () => {
+    expect(buildDeletionQueue([
+      {
+        archivePath: "D:/voice/BJ633449.7z",
+        workCode: "BJ633449",
+        workId: 100000007,
+        missingFiles: ["missing.mp3"],
+      },
+    ])).toContain("BJ633449\tD:/voice/BJ633449.7z");
+    expect(parseDeletionQueue("作品ID\t压缩包路径\nBJ633449\tD:/voice/BJ633449.7z\n")).toEqual([{
+      archivePath: "D:/voice/BJ633449.7z",
+      workCode: "BJ633449",
+      missingFiles: ["来自检查结果"],
+    }]);
+  });
+});
+
+describe("配置与结果目录", () => {
+  test("配置路径相对于配置文件解析并拒绝非对象根节点", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-config-test-"));
+    try {
+      const configPath = join(root, "config.json");
+      await Bun.write(configPath, JSON.stringify({ archiveDir: "./archives", outputDir: "./results" }));
+      const config = await loadConfig({ mode: "archives", configPath, help: false });
+      expect(config.archiveDir).toBe(resolve(root, "archives"));
+      expect(config.outputDir).toBe(resolve(root, "results"));
+
+      await Bun.write(configPath, "[]");
+      expect(loadConfig({ mode: "archives", configPath, help: false })).rejects.toThrow("根节点必须是 JSON 对象");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("结果目录写入失败时保留旧结果，成功时原子替换", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-results-test-"));
+    const outputDir = join(root, "output");
+    try {
+      await mkdir(outputDir);
+      await Bun.write(join(outputDir, "old.txt"), "old");
+      expect(replaceOutputDirectory(outputDir, async (stagingDir) => {
+        await Bun.write(join(stagingDir, "new.txt"), "new");
+        throw new Error("模拟写入失败");
+      })).rejects.toThrow("模拟写入失败");
+      expect(await Bun.file(join(outputDir, "old.txt")).text()).toBe("old");
+
+      await replaceOutputDirectory(outputDir, async (stagingDir) => {
+        await Bun.write(join(stagingDir, "new.txt"), "new");
+      });
+      expect(await Bun.file(join(outputDir, "old.txt")).exists()).toBeFalse();
+      expect(await Bun.file(join(outputDir, "new.txt")).text()).toBe("new");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("本地目录扫描", () => {
+  test("并发扫描嵌套压缩包并识别标准作品文件夹", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-scan-test-"));
+    try {
+      const nested = join(root, "nested");
+      const workFolder = join(nested, "RJ01000000");
+      await mkdir(workFolder, { recursive: true });
+      const archivePath = join(workFolder, "RJ01000001.7z");
+      await Bun.write(archivePath, "archive");
+      await Bun.write(join(nested, "ignored.zip"), "zip");
+      expect(await findArchives(root)).toEqual([resolve(archivePath)]);
+      expect(await findDownloadedWorkFolders(root)).toEqual([{
+        path: resolve(workFolder),
+        workCode: "RJ01000000",
+      }]);
+      expect(await findDownloadedWorkFolders(join(root, "missing"))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -301,7 +427,6 @@ describe("下载体积限制", () => {
       downloadDir: ".",
       outputDir: "./output",
       sevenZipPath: "7z",
-      downloaderPath: "asmroner",
       concurrency: 1,
       requestTimeoutMs: 30_000,
       maxDownloadSize: "10 B",
@@ -333,19 +458,51 @@ describe("API 请求", () => {
     await Promise.all([throttle(), throttle(), throttle()]);
     expect(performance.now() - startedAt).toBeGreaterThanOrEqual(90);
   });
+
+  test("拒绝无效的请求速率", () => {
+    expect(() => createRequestThrottle(0)).toThrow("必须是正数");
+    expect(() => createRequestThrottle(Number.NaN)).toThrow("必须是正数");
+  });
+});
+
+describe("受限并发", () => {
+  test("映射器抛出 undefined 时也会正确拒绝", async () => {
+    let rejected = false;
+    try {
+      await mapLimit([1], 1, async () => {
+        throw undefined;
+      });
+    } catch (error) {
+      rejected = true;
+      expect(error).toBeUndefined();
+    }
+    expect(rejected).toBeTrue();
+  });
 });
 
 describe("删除不完整作品", () => {
+  test("同一文件的重复记录只规划一次", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-deduplicate-test-"));
+    try {
+      const archivePath = join(root, "RJ01000000.7z");
+      await Bun.write(archivePath, "x");
+      const item = { archivePath, workCode: "RJ01000000" as const, workId: 1000000, missingFiles: ["missing.wav"] };
+      expect(await buildDeletionPlan([item, item], root)).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("只规划确认不完整且位于归档目录内的 7z", async () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-test-"));
     try {
       const archivePath = join(root, "RJ01000000.7z");
       await Bun.write(archivePath, "incomplete archive");
       const plan = await buildDeletionPlan([
-        { archivePath, workId: 1000000, missingFiles: ["missing.wav"] },
-        { archivePath: join(root, "RJ01000001.7z"), workId: 1000001, missingFiles: [], error: "API 失败" },
+        { archivePath, workCode: "RJ01000000", workId: 1000000, missingFiles: ["missing.wav"] },
+        { archivePath: join(root, "RJ01000001.7z"), workCode: "RJ01000001", workId: 1000001, missingFiles: [], error: "API 失败" },
       ], root);
-      expect(plan).toEqual([{ archivePath, workId: 1000000, size: 18 }]);
+      expect(plan).toEqual([{ archivePath, workCode: "RJ01000000", size: 18 }]);
       expect(formatFileSize(plan[0].size)).toBe("18 B");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -358,7 +515,7 @@ describe("删除不完整作品", () => {
       const archivePath = join(root, "RJ01000000.7z");
       await Bun.write(archivePath, "x".repeat(2048));
       const plan = await buildDeletionPlan([
-        { archivePath, workId: 1000000, missingFiles: ["missing.wav"] },
+        { archivePath, workCode: "RJ01000000", workId: 1000000, missingFiles: ["missing.wav"] },
       ], root);
       expect(formatFileSize(plan[0].size)).toBe("2.00 KB");
       expect(await deleteArchives(plan)).toEqual([]);
@@ -375,8 +532,30 @@ describe("删除不完整作品", () => {
       const archivePath = join(outside, "RJ01000000.7z");
       await Bun.write(archivePath, "x");
       expect(buildDeletionPlan([
-        { archivePath, workId: 1000000, missingFiles: ["missing.wav"] },
+        { archivePath, workCode: "RJ01000000", workId: 1000000, missingFiles: ["missing.wav"] },
       ], root)).rejects.toThrow("archiveDir 之外");
+    } finally {
+      await Promise.all([
+        rm(root, { recursive: true, force: true }),
+        rm(outside, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  test("拒绝通过目录链接逃逸到归档目录之外", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-link-root-"));
+    const outside = await mkdtemp(join(tmpdir(), "asmr-archive-delete-link-outside-"));
+    try {
+      const archivePath = join(outside, "RJ01000000.7z");
+      const linkedDirectory = join(root, "linked");
+      await Bun.write(archivePath, "x");
+      await symlink(outside, linkedDirectory, process.platform === "win32" ? "junction" : "dir");
+      expect(buildDeletionPlan([{
+        archivePath: join(linkedDirectory, "RJ01000000.7z"),
+        workCode: "RJ01000000",
+        workId: 1000000,
+        missingFiles: ["missing.wav"],
+      }], root)).rejects.toThrow("archiveDir 之外");
     } finally {
       await Promise.all([
         rm(root, { recursive: true, force: true }),
@@ -394,8 +573,8 @@ describe("删除非该作者作品", () => {
       "RJ01602072\t文件夹\tD:/download/RJ01602072",
       "",
     ].join("\n"))).toEqual([
-      { path: "D:/voice/RJ328352.7z", workId: 328352, type: "压缩包" },
-      { path: "D:/download/RJ01602072", workId: 1602072, type: "文件夹" },
+      { path: "D:/voice/RJ328352.7z", workCode: "RJ328352", type: "压缩包" },
+      { path: "D:/download/RJ01602072", workCode: "RJ01602072", type: "文件夹" },
     ]);
     expect(() => parseNonAuthorWorkList("作品ID\t路径\nRJ328352\tD:/voice/RJ328352.7z\n"))
       .toThrow("重新运行 author");
@@ -414,13 +593,13 @@ describe("删除非该作者作品", () => {
         Bun.write(join(folderPath, "track.wav"), "downloaded audio"),
       ]);
       const plan = await buildNonAuthorDeletionPlan([
-        { path: archivePath, workId: 328352, type: "压缩包" },
-        { path: folderPath, workId: 1602072, type: "文件夹" },
+        { path: archivePath, workCode: "RJ328352", type: "压缩包" },
+        { path: folderPath, workCode: "RJ01602072", type: "文件夹" },
       ], archiveRoot, downloadRoot);
 
       expect(plan).toEqual([
-        { path: archivePath, workId: 328352, type: "压缩包", size: 7 },
-        { path: folderPath, workId: 1602072, type: "文件夹", size: 16 },
+        { path: archivePath, workCode: "RJ328352", type: "压缩包", size: 7 },
+        { path: folderPath, workCode: "RJ01602072", type: "文件夹", size: 16 },
       ]);
       expect(await deleteNonAuthorWorks(plan)).toEqual([]);
       expect(await Bun.file(archivePath).exists()).toBeFalse();
@@ -438,11 +617,11 @@ describe("删除非该作者作品", () => {
     try {
       await Promise.all([Bun.write(outsidePath, "x"), Bun.write(insidePath, "x")]);
       expect(buildNonAuthorDeletionPlan([
-        { path: outsidePath, workId: 328352, type: "压缩包" },
+        { path: outsidePath, workCode: "RJ328352", type: "压缩包" },
       ], root)).rejects.toThrow("允许目录之外");
       expect(buildNonAuthorDeletionPlan([
-        { path: insidePath, workId: 123456, type: "压缩包" },
-      ], root)).rejects.toThrow("RJ 编号与清单不一致");
+        { path: insidePath, workCode: "RJ123456", type: "压缩包" },
+      ], root)).rejects.toThrow("作品编号与清单不一致");
     } finally {
       await Promise.all([
         rm(root, { recursive: true, force: true }),

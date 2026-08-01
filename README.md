@@ -10,15 +10,18 @@
 - `delete-non-author`：读取 `author` 生成的非该作者作品清单，确认后删除其中的压缩包和作品文件夹；
 - `download`：读取检查阶段生成的汇总文件，批量下载完整作品。
 
-检查阶段只用 7-Zip 读取压缩包内的文件名，不会解压，也不会自动下载。下载后的文件夹统一改名为作品的标准 RJ 编号，例如旧制 `RJ328352`、新制 `RJ01602072`。
+检查阶段只用 7-Zip 读取压缩包内的文件名，不会解压，也不会自动下载。下载后的文件夹统一使用作品的真实来源编号，例如 `RJ328352`、`RJ01602072` 或 `BJ633449`。
 
 ## 环境要求
 
 - [Bun](https://bun.sh/)；
-- 7-Zip，命令行可运行 `7z`；
-- [asmr-downloader](https://github.com/fireinrain/asmr-downloader/releases)，命令行可运行 `asmroner`，并且已执行 `asmroner config` 完成初始化。
+- 7-Zip，命令行可运行 `7z`。
 
-Windows 下的 `asmroner v2.0.6` 会错误清洗完整绝对路径和作品文件名：前者会生成 `C_` 文件夹，后者遇到 `?` 等字符会下载失败。因此 Windows 下载模式直接使用网站文件列表下载，并安全清洗文件名；文件响应会以分块流方式直接写入磁盘，避免并发下载大文件时占用过多内存。程序读取项目下 `.asmroner-data/config.toml` 中的 `proxy_url`、`prefer_media`、`max_retries` 和 `max_workers`；`author` 和 `archives` 模式的 API 请求也使用该 `proxy_url`，并按 `sync_qps` 限速。其他平台继续调用 `asmroner`。每次下载的都是整部作品，不会只补缺失文件。
+下载模式在所有平台都直接读取网站文件树，并下载其中的全部资源，不会在 MP3、WAV、FLAC 或其他资源之间做互斥筛选。文件响应以分块流直接写入磁盘，避免并发下载大文件时占用过多内存；文件名会经过安全清洗。如果项目下已有 `.asmroner-data/config.toml`，程序会复用其中的 `proxy_url`、`max_retries`、`max_workers` 和 `sync_qps`，但不再调用 `asmroner`，也不读取 `prefer_media`。每次下载的都是整部作品，不会只补缺失文件。
+
+## 日志
+
+程序使用 Winston 输出带时间戳和级别的日志，默认级别为 `info`。可通过 `LOG_LEVEL` 设置 `error`、`warn`、`info`、`http`、`verbose`、`debug` 或 `silly`；错误写入 stderr，警告和普通日志写入对应的控制台流。
 
 ## 配置
 
@@ -37,7 +40,6 @@ Copy-Item config.example.json config.json
   "downloadDir": "D:/path/to/downloads",
   "outputDir": "./output",
   "sevenZipPath": "7z",
-  "downloaderPath": "asmroner",
   "maxDownloadSize": "100 GB",
   "concurrency": 4,
   "requestTimeoutMs": 30000
@@ -49,7 +51,6 @@ Copy-Item config.example.json config.json
 - `downloadDir`：完整作品保存目录。`download` 模式要求明确填写，`delete-non-author` 也会将其作为允许删除作品文件夹的目录；
 - `outputDir`：检查结果和待下载汇总所在目录；
 - `sevenZipPath`：7-Zip 命令或完整路径；
-- `downloaderPath`：`asmroner` 命令或完整路径；
 - `maxDownloadSize`：单次运行允许完成下载的最大总体积，例如 `"100 GB"`。支持 B、KB、MB、GB、TB（按 1024 换算）；设为 `""` 表示不限制；
 - `concurrency`：API 和压缩包检查的并发数，范围 1–20；
 - `requestTimeoutMs`：单次 API 请求超时毫秒数。
@@ -143,19 +144,36 @@ bun run archives -- --dir "D:\音声\待检查" --output "D:\检查结果"
 ## 检查与下载规则
 
 - `RJ1602072.7z`、`RJ01602072.7z` 和名称中包含该编号的 7z 都映射到 API ID `1602072`；
+- `BJ633449` 使用 API 内部 ID `100000007` 获取文件列表，但清单、搜索词和下载目录始终保留真实来源编号 `BJ633449`；
 - `archives` 模式按编号制式使用 `RJ123`、`RJ328352` 或 `RJ01602072` 作为搜索词，并要求 API 返回的 ID 精确匹配；旧文件名中的多余前导零会被去掉；
 - `delete` 模式不重复检查，只删除最近一次 `author` 或 `archives` 确认缺少文件且位于 `archiveDir` 内的 7z；
 - `delete-non-author` 模式不重复检查，只删除最近一次 `author` 清单中位于允许目录内的非该作者压缩包和作品文件夹；
 - 比较时优先匹配完整相对路径；若目录名被清理过，再按尚未匹配的文件名和重复数量核对；
 - 网站列出的任何文件缺失都会判为不完整；压缩包内的额外文件不影响结果；
 - 待下载汇总会把遗漏作品和不完整作品按编号去重；
-- `author` 模式会把作者作品列表之外、且能从名称识别 RJ 编号的本地压缩包和作品文件夹写入单独清单；
+- `author` 模式会把作者作品列表之外、且能从名称识别 RJ/BJ 编号的本地压缩包和作品文件夹写入单独清单；
 - `download` 模式逐行读取汇总，下载完整作品；
 - 设置下载体积限制后，每部作品完成时累计其文件夹体积；达到限制后停止开始下一部作品，不会切断当前作品；
-- 下载先进入 `downloadDir/.asmr-archive-checker-downloads` 下的临时目录，成功后移动并改名为标准 RJ 编号；Windows 非法文件名字符会替换为 `_`；
+- 下载先进入 `downloadDir/.asmr-archive-checker-downloads` 下的临时目录，成功后移动并改名为真实来源编号；Windows 非法文件名字符会替换为 `_`；
 - 标准名称的目标文件夹已经存在时会跳过，不覆盖已有文件；失败时保留每部作品固定的临时目录，再次运行会校验文件大小并续传尚未完成的文件。旧版本生成的随机临时目录也会自动选择数据最多的一份继续下载。
 
-无法从文件名识别 RJ 编号的 7z 无法自动检查或加入下载汇总，程序会在命令行提示数量。
+无法从文件名识别 RJ/BJ 编号的 7z 无法自动检查或加入下载汇总，程序会在命令行提示数量。
+
+## 程序架构
+
+项目使用函数式模块组织，不使用类或可变领域对象：
+
+- `src/domain/work-code.ts`：RJ/BJ 编号规范化、文件名识别和 API 元数据映射；
+- `src/domain/archive.ts`：7-Zip 清单解析、网站文件树展开、文件名清洗和完整性比较；
+- `src/domain/records.ts`：下载/删除清单解析与生成、非作者作品集合运算；
+- `src/application.ts`：组合 author、archives、delete 和 download 用例，不实现底层 I/O；
+- `src/api.ts`、`src/archive-service.ts`、`src/results-store.ts`：API、归档扫描和结果文件适配器；
+- `src/downloader.ts`、`src/deletion.ts`：下载与删除副作用边界；
+- `src/logger.ts`：Winston 日志格式、级别和 Console transport；
+- `src/config.ts`：参数解析、配置加载和目录前置条件；
+- `src/index.ts`：仅负责公开 API 重导出和进程启动。
+
+依赖方向固定为 `index -> application -> adapters -> domain`。`domain` 下的函数只根据输入计算输出，不访问文件系统、网络、环境变量或进程状态；副作用按功能集中在适配器中，并通过函数参数注入下载执行器，便于独立测试领域规则。
 
 ## 输出
 
@@ -165,7 +183,7 @@ bun run archives -- --dir "D:\音声\待检查" --output "D:\检查结果"
 - `遗漏下载的音声.txt`：`author` 模式发现的遗漏作品；
 - `待下载的音声.txt`：下载模式读取的汇总，包含作品编号、原因和来源。
 - `待删除的不完整压缩包.txt`：删除模式读取的专用清单，仅包含检查确认不完整的压缩包，不包含检查失败项。
-- `非该作者的作品.txt`：仅由 `author` 模式生成，包含不属于当前作者作品列表的 RJ 编号、类型和本地路径，也是 `delete-non-author` 的删除依据。
+- `非该作者的作品.txt`：仅由 `author` 模式生成，包含不属于当前作者作品列表的 RJ/BJ 编号、类型和本地路径，也是 `delete-non-author` 的删除依据。
 
 API/7-Zip 检查错误或下载失败时，进程退出码为 2。
 
