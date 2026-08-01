@@ -7,6 +7,7 @@
     "check": "bun run src/index.ts",
     "author": "bun run src/index.ts author",
     "archives": "bun run src/index.ts archives",
+    "delete": "bun run src/index.ts delete",
     "download": "bun run src/index.ts download",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

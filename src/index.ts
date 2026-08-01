@@ -1,11 +1,13 @@
-import { mkdir, mkdtemp, open, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 
 const API_BASE_URL = "https://api.asmr-200.com";
 const SEARCH_PAGE_SIZE = 100;
 const INCOMPLETE_FILE_NAME = "不完整的压缩包.txt";
 const MISSING_FILE_NAME = "遗漏下载的音声.txt";
 const DOWNLOAD_QUEUE_FILE_NAME = "待下载的音声.txt";
+const DELETE_QUEUE_FILE_NAME = "待删除的不完整压缩包.txt";
 
 export type Config = {
   author: string;
@@ -18,7 +20,7 @@ export type Config = {
   requestTimeoutMs: number;
 };
 
-export type Mode = "author" | "archives" | "download";
+export type Mode = "author" | "archives" | "delete" | "download";
 
 type SearchWork = {
   id: number;
@@ -62,11 +64,22 @@ type ArchiveEntry = {
   attributes: string;
 };
 
-type IncompleteArchive = {
+export type IncompleteArchive = {
   archivePath: string;
   workId: number;
   missingFiles: string[];
   error?: string;
+};
+
+export type DeletionCandidate = {
+  archivePath: string;
+  workId: number;
+  size: number;
+};
+
+export type DeletionFailure = {
+  archivePath: string;
+  error: string;
 };
 
 type DownloadResult = {
@@ -108,6 +121,7 @@ function usage(): string {
 命令：
   author                按作者核对并汇总遗漏和不完整作品
   archives              检查目录内每一个 7z，汇总不完整作品
+  delete                读取已有检查结果，确认后删除不完整作品
   download              读取待下载汇总并下载完整作品
 
 选项：
@@ -126,7 +140,10 @@ export function parseArgs(args: string[]): CliOptions {
   const values = [...args];
   if (values[0] === "--") values.shift();
   let mode: Mode = "author";
-  if (values[0] === "author" || values[0] === "archives" || values[0] === "download") {
+  if (
+    values[0] === "author" || values[0] === "archives" ||
+    values[0] === "delete" || values[0] === "download"
+  ) {
     mode = values.shift() as Mode;
   }
   const result: CliOptions = { mode, help: false };
@@ -666,6 +683,99 @@ async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T, index
   return results;
 }
 
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = "B";
+  for (const nextUnit of units) {
+    value /= 1024;
+    unit = nextUnit;
+    if (value < 1024 || nextUnit === units.at(-1)) break;
+  }
+  return `${value.toFixed(2)} ${unit}`;
+}
+
+export async function buildDeletionPlan(
+  incomplete: IncompleteArchive[],
+  archiveDir: string,
+): Promise<DeletionCandidate[]> {
+  const root = resolve(archiveDir);
+  const candidates: DeletionCandidate[] = [];
+  for (const item of incomplete) {
+    if (item.error || item.missingFiles.length === 0) continue;
+    const archivePath = resolve(item.archivePath);
+    if (!containsPath(root, archivePath) || archivePath === root) {
+      throw new Error(`拒绝删除 archiveDir 之外的文件：${archivePath}`);
+    }
+    if (extname(archivePath).toLowerCase() !== ".7z") {
+      throw new Error(`拒绝删除非 7z 文件：${archivePath}`);
+    }
+    const info = await stat(archivePath);
+    if (!info.isFile()) throw new Error(`删除候选不是普通文件：${archivePath}`);
+    candidates.push({ archivePath, workId: item.workId, size: info.size });
+  }
+  return candidates;
+}
+
+export async function deleteArchives(candidates: DeletionCandidate[]): Promise<DeletionFailure[]> {
+  const failures: DeletionFailure[] = [];
+  for (const candidate of candidates) {
+    try {
+      await unlink(candidate.archivePath);
+    } catch (error) {
+      failures.push({ archivePath: candidate.archivePath, error: errorMessage(error) });
+    }
+  }
+  return failures;
+}
+
+async function confirmDeletion(count: number): Promise<boolean> {
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await readline.question(`确认永久删除以上 ${count} 个文件？输入 DELETE 继续：`);
+    return answer.trim() === "DELETE";
+  } finally {
+    readline.close();
+  }
+}
+
+async function previewAndDeleteIncomplete(
+  incomplete: IncompleteArchive[],
+  config: Config,
+): Promise<void> {
+  const candidates = await buildDeletionPlan(incomplete, config.archiveDir);
+  const totalSize = candidates.reduce((sum, item) => sum + item.size, 0);
+
+  console.log("\n删除预览：");
+  console.log(`确认不完整：${candidates.length} 个`);
+  console.log(`文件总大小：${formatFileSize(totalSize)}（${totalSize} 字节）`);
+  if (candidates.length === 0) {
+    console.log("没有确认不完整的压缩包可删除。");
+    return;
+  }
+
+  console.log("文件列表：");
+  for (const [index, candidate] of candidates.entries()) {
+    console.log(`${index + 1}. [${formatFileSize(candidate.size)}] ${candidate.archivePath}`);
+  }
+  console.log("");
+
+  if (!(await confirmDeletion(candidates.length))) {
+    console.log("已取消，未删除任何文件。");
+    return;
+  }
+
+  const failures = await deleteArchives(candidates);
+  const deletedCount = candidates.length - failures.length;
+  console.log(`删除完成：成功 ${deletedCount} 个，失败 ${failures.length} 个，释放 ${formatFileSize(
+    candidates.filter((candidate) => !failures.some((failure) => failure.archivePath === candidate.archivePath))
+      .reduce((sum, candidate) => sum + candidate.size, 0),
+  )}。`);
+  for (const failure of failures) console.error(`删除失败：${failure.archivePath}：${failure.error}`);
+  if (failures.length > 0) process.exitCode = 2;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -687,9 +797,47 @@ export function parseDownloadQueue(text: string): number[] {
   return [...ids];
 }
 
+export function parseDeletionQueue(text: string): IncompleteArchive[] {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (lines[0] !== "作品ID\t压缩包路径") {
+    throw new Error("待删除清单格式无效，请重新运行 author 或 archives 模式");
+  }
+  return lines.slice(1).map((line) => {
+    const separator = line.indexOf("\t");
+    if (separator < 0) throw new Error(`待删除清单中存在无效记录：${line}`);
+    const displayId = line.slice(0, separator).trim();
+    const archivePath = line.slice(separator + 1).trim();
+    if (!/^RJ\d+$/i.test(displayId) || !archivePath) {
+      throw new Error(`待删除清单中存在无效记录：${line}`);
+    }
+    const workId = workIdFromArchiveName(`${displayId}.7z`);
+    if (workId === undefined) throw new Error(`待删除清单中存在无效作品编号：${displayId}`);
+    return { archivePath, workId, missingFiles: ["来自检查结果"] };
+  });
+}
+
+export function buildDeletionQueue(incomplete: IncompleteArchive[]): string {
+  const lines = [
+    "作品ID\t压缩包路径",
+    ...incomplete
+      .filter((item) => !item.error && item.missingFiles.length > 0)
+      .map((item) => `${displayWorkId(item.workId)}\t${sanitizeColumn(item.archivePath)}`),
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+async function readDeletionQueue(outputDir: string): Promise<IncompleteArchive[]> {
+  const path = join(outputDir, DELETE_QUEUE_FILE_NAME);
+  const file = Bun.file(path);
+  if (!(await file.exists())) {
+    throw new Error(`未找到待删除清单：${path}，请先重新运行 author 或 archives 模式`);
+  }
+  return parseDeletionQueue(await file.text());
+}
+
 async function readOutputSnapshot(outputDir: string): Promise<Map<string, string>> {
   const snapshot = new Map<string, string>();
-  for (const name of [INCOMPLETE_FILE_NAME, MISSING_FILE_NAME, DOWNLOAD_QUEUE_FILE_NAME]) {
+  for (const name of [INCOMPLETE_FILE_NAME, MISSING_FILE_NAME, DOWNLOAD_QUEUE_FILE_NAME, DELETE_QUEUE_FILE_NAME]) {
     const file = Bun.file(join(outputDir, name));
     if (await file.exists()) snapshot.set(name, await file.text());
   }
@@ -1036,6 +1184,7 @@ async function writeResults(
   const incompletePath = join(config.outputDir, INCOMPLETE_FILE_NAME);
   const missingPath = join(config.outputDir, MISSING_FILE_NAME);
   const downloadQueuePath = join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME);
+  const deleteQueuePath = join(config.outputDir, DELETE_QUEUE_FILE_NAME);
 
   const incompleteText = incomplete.length > 0
     ? `${incomplete.map((item) => item.archivePath).join("\n")}\n`
@@ -1060,6 +1209,7 @@ async function writeResults(
     Bun.write(incompletePath, incompleteText),
     Bun.write(missingPath, `${missingLines.join("\n")}\n`),
     Bun.write(downloadQueuePath, `${queueLines.join("\n")}\n`),
+    Bun.write(deleteQueuePath, buildDeletionQueue(incomplete)),
   ]);
 }
 
@@ -1074,6 +1224,17 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   const config = await loadConfig(cli);
+
+  if (cli.mode === "delete") {
+    await requireDirectory(config.archiveDir, "archiveDir");
+    await requireDirectory(config.outputDir, "outputDir");
+    const incomplete = await readDeletionQueue(config.outputDir);
+    console.log("模式：delete");
+    console.log(`读取检查结果：${join(config.outputDir, DELETE_QUEUE_FILE_NAME)}`);
+    await previewAndDeleteIncomplete(incomplete, config);
+    console.log(`结果目录：${config.outputDir}`);
+    return;
+  }
 
   if (cli.mode === "download") {
     await ensureDirectory(config.outputDir, "outputDir");
@@ -1127,7 +1288,12 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
   if (unknownArchives.length > 0) console.log(`无法识别 RJ 编号的 7z：${unknownArchives.length} 个`);
   const checked = await mapLimit(archivesToCheck, config.concurrency, async (archive, index) => {
     console.log(`[${index + 1}/${archivesToCheck.length}] 检查 ${basename(archive.path)}`);
-    return checkArchive(archive.path, archive.workId, config, cli.mode === "archives");
+    return checkArchive(
+      archive.path,
+      archive.workId,
+      config,
+      cli.mode === "archives",
+    );
   });
   const incomplete = checked.filter((item): item is IncompleteArchive => item !== undefined);
   const downloadedIds = new Set([

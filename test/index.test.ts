@@ -4,13 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildDownloadFilePlan,
+  buildDeletionPlan,
+  buildDeletionQueue,
   buildSearchUrl,
   buildWorkSearchUrl,
+  deleteArchives,
   findMissingFiles,
   flattenTrackTree,
+  formatFileSize,
   formatWorkId,
   isCompleteDownloadFile,
   parseArgs,
+  parseDeletionQueue,
   parseDownloadQueue,
   parseSevenZipListing,
   prepareBuiltinStagingPath,
@@ -158,6 +163,7 @@ describe("命令行参数", () => {
   test("区分作者和全压缩包模式", () => {
     expect(parseArgs(["author"]).mode).toBe("author");
     expect(parseArgs(["archives"]).mode).toBe("archives");
+    expect(parseArgs(["delete"]).mode).toBe("delete");
     expect(parseArgs(["download"]).mode).toBe("download");
   });
 
@@ -169,5 +175,80 @@ describe("命令行参数", () => {
       "RJ01616933\t遗漏\t标题二",
       "",
     ].join("\n"))).toEqual([1602072, 1616933]);
+  });
+
+  test("读取 author 和 archives 生成的待删除清单", () => {
+    expect(parseDeletionQueue([
+      "作品ID\t压缩包路径",
+      "RJ01602072\tD:/voice/RJ01602072.7z",
+      "",
+    ].join("\n"))).toEqual([{
+      archivePath: "D:/voice/RJ01602072.7z",
+      workId: 1602072,
+      missingFiles: ["来自检查结果"],
+    }]);
+    expect(() => parseDeletionQueue("D:/voice/RJ01602072.7z\n")).toThrow("重新运行 author 或 archives");
+  });
+
+  test("待删除清单排除检查失败项", () => {
+    expect(buildDeletionQueue([
+      { archivePath: "D:/voice/RJ01602072.7z", workId: 1602072, missingFiles: ["missing.wav"] },
+      { archivePath: "D:/voice/RJ01616933.7z", workId: 1616933, missingFiles: [], error: "API 失败" },
+    ])).toBe([
+      "作品ID\t压缩包路径",
+      "RJ01602072\tD:/voice/RJ01602072.7z",
+      "",
+    ].join("\n"));
+  });
+});
+
+describe("删除不完整作品", () => {
+  test("只规划确认不完整且位于归档目录内的 7z", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-test-"));
+    try {
+      const archivePath = join(root, "RJ00000001.7z");
+      await Bun.write(archivePath, "incomplete archive");
+      const plan = await buildDeletionPlan([
+        { archivePath, workId: 1, missingFiles: ["missing.wav"] },
+        { archivePath: join(root, "RJ00000002.7z"), workId: 2, missingFiles: [], error: "API 失败" },
+      ], root);
+      expect(plan).toEqual([{ archivePath, workId: 1, size: 18 }]);
+      expect(formatFileSize(plan[0].size)).toBe("18 B");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("删除计划中的文件", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-test-"));
+    try {
+      const archivePath = join(root, "RJ00000001.7z");
+      await Bun.write(archivePath, "x".repeat(2048));
+      const plan = await buildDeletionPlan([
+        { archivePath, workId: 1, missingFiles: ["missing.wav"] },
+      ], root);
+      expect(formatFileSize(plan[0].size)).toBe("2.00 KB");
+      expect(await deleteArchives(plan)).toEqual([]);
+      expect(await Bun.file(archivePath).exists()).toBeFalse();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("拒绝规划归档目录之外的文件", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-root-"));
+    const outside = await mkdtemp(join(tmpdir(), "asmr-archive-delete-outside-"));
+    try {
+      const archivePath = join(outside, "RJ00000001.7z");
+      await Bun.write(archivePath, "x");
+      expect(buildDeletionPlan([
+        { archivePath, workId: 1, missingFiles: ["missing.wav"] },
+      ], root)).rejects.toThrow("archiveDir 之外");
+    } finally {
+      await Promise.all([
+        rm(root, { recursive: true, force: true }),
+        rm(outside, { recursive: true, force: true }),
+      ]);
+    }
   });
 });
