@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, open, readdir, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
@@ -8,6 +8,7 @@ const INCOMPLETE_FILE_NAME = "不完整的压缩包.txt";
 const MISSING_FILE_NAME = "遗漏下载的音声.txt";
 const DOWNLOAD_QUEUE_FILE_NAME = "待下载的音声.txt";
 const DELETE_QUEUE_FILE_NAME = "待删除的不完整压缩包.txt";
+const NON_AUTHOR_FILE_NAME = "非该作者的作品.txt";
 
 export type Config = {
   author: string;
@@ -22,7 +23,7 @@ export type Config = {
   maxDownloadSizeBytes?: number;
 };
 
-export type Mode = "author" | "archives" | "delete" | "download";
+export type Mode = "author" | "archives" | "delete" | "delete-non-author" | "download";
 
 type SearchWork = {
   id: number;
@@ -71,6 +72,21 @@ export type IncompleteArchive = {
   workId: number;
   missingFiles: string[];
   error?: string;
+};
+
+export type NonAuthorWork = {
+  path: string;
+  workId: number;
+  type: "压缩包" | "文件夹";
+};
+
+export type NonAuthorDeletionCandidate = NonAuthorWork & {
+  size: number;
+};
+
+export type NonAuthorDeletionFailure = {
+  path: string;
+  error: string;
 };
 
 export type DeletionCandidate = {
@@ -134,6 +150,7 @@ function usage(): string {
   author                按作者核对并汇总遗漏和不完整作品
   archives              检查目录内每一个 7z，汇总不完整作品
   delete                读取已有检查结果，确认后删除不完整作品
+  delete-non-author     读取作者检查结果，确认后删除非该作者作品
   download              读取待下载汇总并下载完整作品
 
 选项：
@@ -156,7 +173,8 @@ export function parseArgs(args: string[]): CliOptions {
   let mode: Mode = "author";
   if (
     values[0] === "author" || values[0] === "archives" ||
-    values[0] === "delete" || values[0] === "download"
+    values[0] === "delete" || values[0] === "delete-non-author" ||
+    values[0] === "download"
   ) {
     mode = values.shift() as Mode;
   }
@@ -340,7 +358,8 @@ export function buildSearchUrl(author: string, page: number, pageSize = SEARCH_P
 }
 
 export function formatWorkId(id: number): string {
-  return `RJ${String(id).padStart(8, "0")}`;
+  const width = id < 1_000_000 ? 6 : 8;
+  return `RJ${String(id).padStart(width, "0")}`;
 }
 
 export function buildWorkSearchUrl(id: number): string {
@@ -770,10 +789,86 @@ export async function deleteArchives(candidates: DeletionCandidate[]): Promise<D
   return failures;
 }
 
-async function confirmDeletion(count: number): Promise<boolean> {
+export async function buildNonAuthorDeletionPlan(
+  works: NonAuthorWork[],
+  archiveDir: string,
+  downloadDir = "",
+): Promise<NonAuthorDeletionCandidate[]> {
+  const archiveRoot = resolve(archiveDir);
+  const folderRoots = [archiveRoot, ...(downloadDir ? [resolve(downloadDir)] : [])];
+  const candidates = new Map<string, NonAuthorDeletionCandidate>();
+
+  for (const work of works) {
+    const targetPath = resolve(work.path);
+    const allowedRoots = work.type === "压缩包" ? [archiveRoot] : folderRoots;
+    if (!allowedRoots.some((root) => targetPath !== root && containsPath(root, targetPath))) {
+      throw new Error(
+        `拒绝删除允许目录之外的${work.type}：${targetPath}`,
+      );
+    }
+
+    const targetId = workIdFromArchiveName(
+      work.type === "文件夹" ? `${basename(targetPath)}.7z` : targetPath,
+    );
+    if (targetId !== work.workId) {
+      throw new Error(`删除目标的 RJ 编号与清单不一致：${targetPath}`);
+    }
+
+    let info;
+    try {
+      info = await lstat(targetPath);
+    } catch (error) {
+      throw new Error(`无法使用删除目标 ${targetPath}：${errorMessage(error)}`);
+    }
+    if (info.isSymbolicLink()) throw new Error(`拒绝删除符号链接：${targetPath}`);
+    if (work.type === "压缩包") {
+      if (extname(targetPath).toLowerCase() !== ".7z" || !info.isFile()) {
+        throw new Error(`删除目标不是普通 7z 文件：${targetPath}`);
+      }
+    } else if (!/^RJ\d+$/i.test(basename(targetPath)) || !info.isDirectory()) {
+      throw new Error(`删除目标不是标准 RJ 作品文件夹：${targetPath}`);
+    }
+
+    const key = process.platform === "win32" ? targetPath.toLowerCase() : targetPath;
+    const candidate = {
+      ...work,
+      path: targetPath,
+      size: work.type === "压缩包" ? info.size : await directorySize(targetPath),
+    };
+    const existing = candidates.get(key);
+    if (existing && (existing.workId !== candidate.workId || existing.type !== candidate.type)) {
+      throw new Error(`待删除清单对同一路径存在冲突记录：${targetPath}`);
+    }
+    candidates.set(key, candidate);
+  }
+
+  const planned = [...candidates.values()];
+  return planned.filter((candidate) =>
+    !planned.some((parent) =>
+      parent.type === "文件夹" && parent.path !== candidate.path && containsPath(parent.path, candidate.path)
+    )
+  );
+}
+
+export async function deleteNonAuthorWorks(
+  candidates: NonAuthorDeletionCandidate[],
+): Promise<NonAuthorDeletionFailure[]> {
+  const failures: NonAuthorDeletionFailure[] = [];
+  for (const candidate of candidates) {
+    try {
+      if (candidate.type === "压缩包") await unlink(candidate.path);
+      else await rm(candidate.path, { recursive: true, force: false });
+    } catch (error) {
+      failures.push({ path: candidate.path, error: errorMessage(error) });
+    }
+  }
+  return failures;
+}
+
+async function confirmDeletion(count: number, noun = "文件"): Promise<boolean> {
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const answer = await readline.question(`确认永久删除以上 ${count} 个文件？输入 DELETE 继续：`);
+    const answer = await readline.question(`确认永久删除以上 ${count} 个${noun}？输入 DELETE 继续：`);
     return answer.trim() === "DELETE";
   } finally {
     readline.close();
@@ -813,6 +908,50 @@ async function previewAndDeleteIncomplete(
       .reduce((sum, candidate) => sum + candidate.size, 0),
   )}。`);
   for (const failure of failures) console.error(`删除失败：${failure.archivePath}：${failure.error}`);
+  if (failures.length > 0) process.exitCode = 2;
+}
+
+async function previewAndDeleteNonAuthorWorks(
+  works: NonAuthorWork[],
+  config: Config,
+): Promise<void> {
+  const candidates = await buildNonAuthorDeletionPlan(works, config.archiveDir, config.downloadDir);
+  const totalSize = candidates.reduce((sum, item) => sum + item.size, 0);
+  const archiveCount = candidates.filter((item) => item.type === "压缩包").length;
+  const folderCount = candidates.length - archiveCount;
+
+  console.log("\n删除预览：");
+  console.log(`非该作者作品：${candidates.length} 项（压缩包 ${archiveCount} 个，文件夹 ${folderCount} 个）`);
+  console.log(`总大小：${formatFileSize(totalSize)}（${totalSize} 字节）`);
+  if (candidates.length === 0) {
+    console.log("没有非该作者作品可删除。");
+    return;
+  }
+
+  console.log("目标列表：");
+  for (const [index, candidate] of candidates.entries()) {
+    console.log(
+      `${index + 1}. [${candidate.type}] [${formatFileSize(candidate.size)}] ` +
+      `${displayWorkId(candidate.workId)} ${candidate.path}`,
+    );
+  }
+  console.log("");
+
+  if (!(await confirmDeletion(candidates.length, "项目"))) {
+    console.log("已取消，未删除任何内容。");
+    return;
+  }
+
+  const failures = await deleteNonAuthorWorks(candidates);
+  const deleted = candidates.filter((candidate) =>
+    !failures.some((failure) => failure.path === candidate.path)
+  );
+  console.log(
+    `删除完成：成功 ${deleted.length} 项，失败 ${failures.length} 项，释放 ${formatFileSize(
+      deleted.reduce((sum, candidate) => sum + candidate.size, 0),
+    )}。`,
+  );
+  for (const failure of failures) console.error(`删除失败：${failure.path}：${failure.error}`);
   if (failures.length > 0) process.exitCode = 2;
 }
 
@@ -866,6 +1005,52 @@ export function buildDeletionQueue(incomplete: IncompleteArchive[]): string {
   return `${lines.join("\n")}\n`;
 }
 
+export function findNonAuthorWorks(
+  authorWorkIds: Iterable<number>,
+  archives: Array<{ path: string; workId: number }>,
+  folders: Array<{ path: string; workId: number }>,
+): NonAuthorWork[] {
+  const authorIds = new Set(authorWorkIds);
+  return [
+    ...archives.map((archive) => ({ ...archive, type: "压缩包" as const })),
+    ...folders.map((folder) => ({ ...folder, type: "文件夹" as const })),
+  ]
+    .filter((item) => !authorIds.has(item.workId))
+    .sort((left, right) =>
+      left.workId - right.workId ||
+      (left.type === right.type ? 0 : left.type === "压缩包" ? -1 : 1) ||
+      left.path.localeCompare(right.path)
+    );
+}
+
+export function buildNonAuthorWorkList(works: NonAuthorWork[]): string {
+  const lines = [
+    "作品ID\t类型\t路径",
+    ...works.map((work) =>
+      `${displayWorkId(work.workId)}\t${work.type}\t${sanitizeColumn(work.path)}`
+    ),
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+export function parseNonAuthorWorkList(text: string): NonAuthorWork[] {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (lines[0] !== "作品ID\t类型\t路径") {
+    throw new Error("非该作者作品清单格式无效，请重新运行 author 模式");
+  }
+  return lines.slice(1).map((line) => {
+    const columns = line.split("\t");
+    if (columns.length !== 3) throw new Error(`非该作者作品清单中存在无效记录：${line}`);
+    const [displayId, type, targetPath] = columns.map((column) => column.trim());
+    if (!/^RJ\d+$/i.test(displayId) || (type !== "压缩包" && type !== "文件夹") || !targetPath) {
+      throw new Error(`非该作者作品清单中存在无效记录：${line}`);
+    }
+    const workId = workIdFromArchiveName(`${displayId}.7z`);
+    if (workId === undefined) throw new Error(`非该作者作品清单中存在无效作品编号：${displayId}`);
+    return { path: targetPath, workId, type };
+  });
+}
+
 async function readDeletionQueue(outputDir: string): Promise<IncompleteArchive[]> {
   const path = join(outputDir, DELETE_QUEUE_FILE_NAME);
   const file = Bun.file(path);
@@ -875,9 +1060,24 @@ async function readDeletionQueue(outputDir: string): Promise<IncompleteArchive[]
   return parseDeletionQueue(await file.text());
 }
 
+async function readNonAuthorWorkList(outputDir: string): Promise<NonAuthorWork[]> {
+  const path = join(outputDir, NON_AUTHOR_FILE_NAME);
+  const file = Bun.file(path);
+  if (!(await file.exists())) {
+    throw new Error(`未找到非该作者作品清单：${path}，请先运行 author 模式`);
+  }
+  return parseNonAuthorWorkList(await file.text());
+}
+
 async function readOutputSnapshot(outputDir: string): Promise<Map<string, string>> {
   const snapshot = new Map<string, string>();
-  for (const name of [INCOMPLETE_FILE_NAME, MISSING_FILE_NAME, DOWNLOAD_QUEUE_FILE_NAME, DELETE_QUEUE_FILE_NAME]) {
+  for (const name of [
+    INCOMPLETE_FILE_NAME,
+    MISSING_FILE_NAME,
+    DOWNLOAD_QUEUE_FILE_NAME,
+    DELETE_QUEUE_FILE_NAME,
+    NON_AUTHOR_FILE_NAME,
+  ]) {
     const file = Bun.file(join(outputDir, name));
     if (await file.exists()) snapshot.set(name, await file.text());
   }
@@ -1254,6 +1454,7 @@ async function writeResults(
   recognizedArchives: Array<{ path: string; workId: number }>,
   incomplete: IncompleteArchive[],
   downloadedFolders: Array<{ path: string; workId: number }>,
+  nonAuthorWorks?: NonAuthorWork[],
 ): Promise<void> {
   await mkdir(config.outputDir, { recursive: true });
   const downloadedIds = new Set([
@@ -1265,6 +1466,7 @@ async function writeResults(
   const missingPath = join(config.outputDir, MISSING_FILE_NAME);
   const downloadQueuePath = join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME);
   const deleteQueuePath = join(config.outputDir, DELETE_QUEUE_FILE_NAME);
+  const nonAuthorPath = join(config.outputDir, NON_AUTHOR_FILE_NAME);
 
   const incompleteText = incomplete.length > 0
     ? `${incomplete.map((item) => item.archivePath).join("\n")}\n`
@@ -1285,12 +1487,16 @@ async function writeResults(
   }
   const queueLines = ["作品ID\t原因\t来源", ...queue.values()];
 
-  await Promise.all([
+  const writes = [
     Bun.write(incompletePath, incompleteText),
     Bun.write(missingPath, `${missingLines.join("\n")}\n`),
     Bun.write(downloadQueuePath, `${queueLines.join("\n")}\n`),
     Bun.write(deleteQueuePath, buildDeletionQueue(incomplete)),
-  ]);
+  ];
+  if (nonAuthorWorks !== undefined) {
+    writes.push(Bun.write(nonAuthorPath, buildNonAuthorWorkList(nonAuthorWorks)));
+  }
+  await Promise.all(writes);
 }
 
 function sanitizeColumn(value: unknown): string {
@@ -1313,6 +1519,17 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
     console.log(`读取检查结果：${join(config.outputDir, DELETE_QUEUE_FILE_NAME)}`);
     await previewAndDeleteIncomplete(incomplete, config);
     console.log(`结果目录：${config.outputDir}`);
+    return;
+  }
+
+  if (cli.mode === "delete-non-author") {
+    await requireDirectory(config.archiveDir, "archiveDir");
+    await requireDirectory(config.outputDir, "outputDir");
+    const works = await readNonAuthorWorkList(config.outputDir);
+    console.log("模式：delete-non-author");
+    console.log(`读取检查结果：${join(config.outputDir, NON_AUTHOR_FILE_NAME)}`);
+    await previewAndDeleteNonAuthorWorks(works, config);
+    console.log(`结果清单保留在：${join(config.outputDir, NON_AUTHOR_FILE_NAME)}`);
     return;
   }
 
@@ -1372,6 +1589,9 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
   const archivesToCheck = cli.mode === "author"
     ? recognizedArchives.filter((archive) => websiteIds.has(archive.workId))
     : recognizedArchives;
+  const nonAuthorWorks = cli.mode === "author"
+    ? findNonAuthorWorks(websiteIds, recognizedArchives, downloadedFolders)
+    : undefined;
 
   const websiteSummary = cli.mode === "author" ? `网站作品：${works.length} 个；` : "";
   console.log(`${websiteSummary}找到 7z：${archives.length} 个；需要核对：${archivesToCheck.length} 个`);
@@ -1396,10 +1616,18 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
     recognizedArchives,
     incomplete,
     downloadedFolders,
+    nonAuthorWorks,
   );
 
   const missingCount = works.filter((work) => !downloadedIds.has(work.id)).length;
   console.log(`完成：不完整压缩包 ${incomplete.length} 个，遗漏下载作品 ${missingCount} 个。`);
+  if (nonAuthorWorks !== undefined) {
+    const nonAuthorWorkCount = new Set(nonAuthorWorks.map((work) => work.workId)).size;
+    console.log(
+      `非该作者作品 ${nonAuthorWorkCount} 部（${nonAuthorWorks.length} 个本地压缩包或文件夹）：` +
+      join(config.outputDir, NON_AUTHOR_FILE_NAME),
+    );
+  }
   console.log(`待下载汇总：${join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME)}`);
   console.log(`结果目录：${config.outputDir}`);
   if (incomplete.some((item) => item.error)) process.exitCode = 2;

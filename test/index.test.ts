@@ -6,11 +6,15 @@ import {
   buildDownloadFilePlan,
   buildDeletionPlan,
   buildDeletionQueue,
+  buildNonAuthorDeletionPlan,
   buildSearchUrl,
   buildWorkSearchUrl,
   deleteArchives,
+  deleteNonAuthorWorks,
   downloadWorks,
+  buildNonAuthorWorkList,
   findMissingFiles,
+  findNonAuthorWorks,
   flattenTrackTree,
   formatFileSize,
   formatWorkId,
@@ -20,6 +24,7 @@ import {
   parseDeletionQueue,
   parseDownloadQueue,
   parseFileSize,
+  parseNonAuthorWorkList,
   parseSevenZipListing,
   prepareBuiltinStagingPath,
   sanitizeDownloadPathSegment,
@@ -107,9 +112,44 @@ describe("下载器调用", () => {
 
 describe("编号识别", () => {
   test("兼容有无前导零的 RJ 编号", () => {
+    expect(workIdFromArchiveName("RJ328352.7z")).toBe(328352);
+    expect(workIdFromArchiveName("RJ00328352.7z")).toBe(328352);
     expect(workIdFromArchiveName("RJ1602072.7z")).toBe(1602072);
     expect(workIdFromArchiveName("作品-RJ01602072.7z")).toBe(1602072);
     expect(workIdFromArchiveName("no-id.7z")).toBeUndefined();
+  });
+});
+
+describe("非该作者作品清单", () => {
+  test("列出作者作品集合之外的压缩包和文件夹", () => {
+    const works = findNonAuthorWorks(
+      [1602072, 1616933],
+      [
+        { path: "D:/voice/RJ01602072.7z", workId: 1602072 },
+        { path: "D:/voice/RJ02000000.7z", workId: 2000000 },
+      ],
+      [
+        { path: "D:/download/RJ02000000", workId: 2000000 },
+        { path: "D:/download/RJ03000000", workId: 3000000 },
+      ],
+    );
+
+    expect(works).toEqual([
+      { path: "D:/voice/RJ02000000.7z", workId: 2000000, type: "压缩包" },
+      { path: "D:/download/RJ02000000", workId: 2000000, type: "文件夹" },
+      { path: "D:/download/RJ03000000", workId: 3000000, type: "文件夹" },
+    ]);
+    expect(buildNonAuthorWorkList(works)).toBe([
+      "作品ID\t类型\t路径",
+      "RJ02000000\t压缩包\tD:/voice/RJ02000000.7z",
+      "RJ02000000\t文件夹\tD:/download/RJ02000000",
+      "RJ03000000\t文件夹\tD:/download/RJ03000000",
+      "",
+    ].join("\n"));
+  });
+
+  test("没有非该作者作品时仍生成带表头的空清单", () => {
+    expect(buildNonAuthorWorkList([])).toBe("作品ID\t类型\t路径\n");
   });
 });
 
@@ -120,9 +160,15 @@ describe("API 路径", () => {
     expect(new URL(url).searchParams.get("page")).toBe("2");
   });
 
-  test("作品编号使用八位 RJ 格式精确搜索", () => {
-    const url = buildWorkSearchUrl(1602072);
-    expect(decodeURIComponent(new URL(url).pathname)).toBe("/api/search/RJ01602072");
+  test("作品编号按新旧格式精确搜索", () => {
+    const oldUrl = buildWorkSearchUrl(328352);
+    const newUrl = buildWorkSearchUrl(1602072);
+    expect(decodeURIComponent(new URL(oldUrl).pathname)).toBe("/api/search/RJ328352");
+    expect(decodeURIComponent(new URL(newUrl).pathname)).toBe("/api/search/RJ01602072");
+    expect(formatWorkId(1)).toBe("RJ000001");
+    expect(formatWorkId(328352)).toBe("RJ328352");
+    expect(formatWorkId(999999)).toBe("RJ999999");
+    expect(formatWorkId(1000000)).toBe("RJ01000000");
     expect(formatWorkId(1602072)).toBe("RJ01602072");
     expect(formatWorkId(1616933)).toBe("RJ01616933");
   });
@@ -167,6 +213,7 @@ describe("命令行参数", () => {
     expect(parseArgs(["author"]).mode).toBe("author");
     expect(parseArgs(["archives"]).mode).toBe("archives");
     expect(parseArgs(["delete"]).mode).toBe("delete");
+    expect(parseArgs(["delete-non-author"]).mode).toBe("delete-non-author");
     expect(parseArgs(["download"]).mode).toBe("download");
   });
 
@@ -207,6 +254,16 @@ describe("命令行参数", () => {
     ])).toBe([
       "作品ID\t压缩包路径",
       "RJ01602072\tD:/voice/RJ01602072.7z",
+      "",
+    ].join("\n"));
+  });
+
+  test("旧制编号的不完整作品不生成不存在的八位编号", () => {
+    expect(buildDeletionQueue([
+      { archivePath: "D:/voice/RJ328352.7z", workId: 328352, missingFiles: ["missing.wav"] },
+    ])).toBe([
+      "作品ID\t压缩包路径",
+      "RJ328352\tD:/voice/RJ328352.7z",
       "",
     ].join("\n"));
   });
@@ -308,6 +365,72 @@ describe("删除不完整作品", () => {
       expect(buildDeletionPlan([
         { archivePath, workId: 1, missingFiles: ["missing.wav"] },
       ], root)).rejects.toThrow("archiveDir 之外");
+    } finally {
+      await Promise.all([
+        rm(root, { recursive: true, force: true }),
+        rm(outside, { recursive: true, force: true }),
+      ]);
+    }
+  });
+});
+
+describe("删除非该作者作品", () => {
+  test("读取 author 生成的非作者作品清单", () => {
+    expect(parseNonAuthorWorkList([
+      "作品ID\t类型\t路径",
+      "RJ328352\t压缩包\tD:/voice/RJ328352.7z",
+      "RJ01602072\t文件夹\tD:/download/RJ01602072",
+      "",
+    ].join("\n"))).toEqual([
+      { path: "D:/voice/RJ328352.7z", workId: 328352, type: "压缩包" },
+      { path: "D:/download/RJ01602072", workId: 1602072, type: "文件夹" },
+    ]);
+    expect(() => parseNonAuthorWorkList("作品ID\t路径\nRJ328352\tD:/voice/RJ328352.7z\n"))
+      .toThrow("重新运行 author");
+  });
+
+  test("规划并删除归档目录和下载目录内的非作者作品", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-non-author-test-"));
+    const archiveRoot = join(root, "archives");
+    const downloadRoot = join(root, "downloads");
+    const archivePath = join(archiveRoot, "RJ328352.7z");
+    const folderPath = join(downloadRoot, "RJ01602072");
+    try {
+      await Promise.all([mkdir(archiveRoot), mkdir(folderPath, { recursive: true })]);
+      await Promise.all([
+        Bun.write(archivePath, "archive"),
+        Bun.write(join(folderPath, "track.wav"), "downloaded audio"),
+      ]);
+      const plan = await buildNonAuthorDeletionPlan([
+        { path: archivePath, workId: 328352, type: "压缩包" },
+        { path: folderPath, workId: 1602072, type: "文件夹" },
+      ], archiveRoot, downloadRoot);
+
+      expect(plan).toEqual([
+        { path: archivePath, workId: 328352, type: "压缩包", size: 7 },
+        { path: folderPath, workId: 1602072, type: "文件夹", size: 16 },
+      ]);
+      expect(await deleteNonAuthorWorks(plan)).toEqual([]);
+      expect(await Bun.file(archivePath).exists()).toBeFalse();
+      expect(await Bun.file(folderPath).exists()).toBeFalse();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("拒绝越界目标和清单中不一致的 RJ 编号", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-non-author-root-"));
+    const outside = await mkdtemp(join(tmpdir(), "asmr-archive-delete-non-author-outside-"));
+    const outsidePath = join(outside, "RJ328352.7z");
+    const insidePath = join(root, "RJ328352.7z");
+    try {
+      await Promise.all([Bun.write(outsidePath, "x"), Bun.write(insidePath, "x")]);
+      expect(buildNonAuthorDeletionPlan([
+        { path: outsidePath, workId: 328352, type: "压缩包" },
+      ], root)).rejects.toThrow("允许目录之外");
+      expect(buildNonAuthorDeletionPlan([
+        { path: insidePath, workId: 123456, type: "压缩包" },
+      ], root)).rejects.toThrow("RJ 编号与清单不一致");
     } finally {
       await Promise.all([
         rm(root, { recursive: true, force: true }),

@@ -8,6 +8,7 @@
     "author": "bun run src/index.ts author",
     "archives": "bun run src/index.ts archives",
     "delete": "bun run src/index.ts delete",
+    "delete-non-author": "bun run src/index.ts delete-non-author",
     "download": "bun run src/index.ts download",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
