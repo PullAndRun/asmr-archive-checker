@@ -1,4 +1,4 @@
-import { basename, join, resolve } from "node:path";
+import { basename, join } from "node:path";
 import { createRequestThrottle, fetchAllWorks, workCodeFromSearchWork } from "./api.ts";
 import { checkArchive, classifyArchives, findArchives, findDownloadedWorkFolders } from "./archive-service.ts";
 import { ensureDirectory, loadConfig, parseArgs, requireDirectory, usage, validateOutputDirectory } from "./config.ts";
@@ -11,7 +11,7 @@ import { previewAndDeleteIncomplete, previewAndDeleteNonAuthorWorks } from "./de
 import { findNonAuthorWorks, parseDownloadQueue, type CodedLocalWork, type IncompleteArchive } from "./domain/records.ts";
 import { formatFileSize } from "./domain/size.ts";
 import { workCodeOf } from "./domain/work-code.ts";
-import { downloadWorks, readDownloaderSettings, resolveDownloadTargets } from "./downloader.ts";
+import { downloadWorks, resolveDownloadTargets } from "./downloader.ts";
 import {
   readDeletionQueue,
   readNonAuthorWorkList,
@@ -50,12 +50,11 @@ const runDownload = async (config: Awaited<ReturnType<typeof loadConfig>>): Prom
   const workCodes = parseDownloadQueue(queueText);
   await ensureDirectory(config.downloadDir, "downloadDir");
   await ensureDirectory(join(config.downloadDir, ".asmr-archive-checker-downloads"), "下载临时目录");
-  const apiSettings = await readDownloaderSettings(resolve("."), config);
   const targets = await resolveDownloadTargets(
     workCodes,
     config,
-    apiSettings.proxyUrl,
-    createRequestThrottle(apiSettings.syncQps),
+    config.proxyUrl,
+    createRequestThrottle(config.syncQps),
   );
   await replaceOutputDirectory(config.outputDir, (stagingDir) => restoreOutputSnapshot(stagingDir, snapshot));
   logger.info("模式：download");
@@ -93,10 +92,9 @@ const runCheck = async (
   ]);
   const downloadedFolders = [...new Map(downloadedFolderGroups.flat().map((folder) => [folder.path, folder])).values()];
   const { recognized: recognizedArchives, unknown: unknownArchives } = classifyArchives(archivePaths);
-  const apiSettings = await readDownloaderSettings(resolve("."), config);
-  const apiThrottle = createRequestThrottle(apiSettings.syncQps);
-  logger.info(`API 请求速率：每秒最多 ${apiSettings.syncQps} 次`);
-  const works = mode === "author" ? await fetchAllWorks(config, apiSettings.proxyUrl, apiThrottle) : [];
+  const apiThrottle = createRequestThrottle(config.syncQps);
+  logger.info(`API 请求速率：每秒最多 ${config.syncQps} 次`);
+  const works = mode === "author" ? await fetchAllWorks(config, config.proxyUrl, apiThrottle) : [];
   const websiteWorks = new Map(works.map((work) => [workCodeFromSearchWork(work), work]));
   const websiteCodes = new Set(websiteWorks.keys());
   const archivesToCheck: CodedLocalWork[] = mode === "author"
@@ -119,7 +117,7 @@ const runCheck = async (
       archive.workCode,
       config,
       archive.workId,
-      apiSettings.proxyUrl,
+      config.proxyUrl,
       apiThrottle,
     );
   });

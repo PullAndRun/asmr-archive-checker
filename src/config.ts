@@ -11,6 +11,10 @@ const DEFAULT_CONFIG: Config = {
   outputDir: "./output",
   sevenZipPath: "7z",
   concurrency: 4,
+  maxWorkers: 4,
+  maxRetries: 3,
+  proxyUrl: "",
+  syncQps: 2,
   requestTimeoutMs: 30_000,
   archiveTimeoutMs: 300_000,
   maxDownloadSize: "",
@@ -125,6 +129,10 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
   if (typeof merged.outputDir !== "string" || !merged.outputDir.trim()) throw new Error("outputDir 必须是非空目录路径");
   if (typeof merged.sevenZipPath !== "string" || !merged.sevenZipPath.trim()) throw new Error("sevenZipPath 必须是非空命令或路径");
   if (!Number.isInteger(merged.concurrency) || merged.concurrency < 1 || merged.concurrency > 20) throw new Error("concurrency 必须是 1 到 20 之间的整数");
+  if (!Number.isInteger(merged.maxWorkers) || merged.maxWorkers < 1 || merged.maxWorkers > 20) throw new Error("maxWorkers 必须是 1 到 20 之间的整数");
+  if (!Number.isInteger(merged.maxRetries) || merged.maxRetries < 0 || merged.maxRetries > 20) throw new Error("maxRetries 必须是 0 到 20 之间的整数");
+  if (typeof merged.proxyUrl !== "string") throw new Error("proxyUrl 必须是字符串");
+  if (!Number.isFinite(merged.syncQps) || merged.syncQps <= 0 || merged.syncQps > 100) throw new Error("syncQps 必须是大于 0 且不超过 100 的数字");
   if (!Number.isFinite(merged.requestTimeoutMs) || merged.requestTimeoutMs < 1_000) throw new Error("requestTimeoutMs 必须不少于 1000 毫秒");
   if (!Number.isFinite(merged.archiveTimeoutMs) || merged.archiveTimeoutMs! < 1_000) throw new Error("archiveTimeoutMs 必须不少于 1000 毫秒");
   if (typeof merged.maxDownloadSize !== "string") throw new Error("maxDownloadSize 必须是带单位的体积字符串或空字符串");
@@ -135,6 +143,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
     archiveDir: resolvePath(configBase, merged.archiveDir),
     downloadDir: merged.downloadDir.trim() ? resolvePath(configBase, merged.downloadDir) : "",
     outputDir: resolvePath(configBase, merged.outputDir),
+    proxyUrl: merged.proxyUrl.trim(),
     maxDownloadSize: merged.maxDownloadSize.trim(),
     maxDownloadSizeBytes: merged.maxDownloadSize.trim() ? parseFileSize(merged.maxDownloadSize) : undefined,
     sevenZipPath: looksLikePath(merged.sevenZipPath) ? resolvePath(configBase, merged.sevenZipPath) : merged.sevenZipPath,

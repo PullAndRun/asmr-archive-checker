@@ -8,6 +8,10 @@ export type Config = {
   outputDir: string;
   sevenZipPath: string;
   concurrency: number;
+  maxWorkers: number;
+  maxRetries: number;
+  proxyUrl: string;
+  syncQps: number;
   requestTimeoutMs: number;
   archiveTimeoutMs?: number;
   maxDownloadSize: string;
@@ -44,14 +48,6 @@ export type SearchResponse = {
     pageSize: number;
     totalCount: number;
   };
-};
-
-export type DownloaderSettings = {
-  maxRetries: number;
-  maxWorkers: number;
-  proxyUrl: string;
-  requestTimeoutMs: number;
-  syncQps: number;
 };
 
 export type RequestThrottle = () => Promise<void>;

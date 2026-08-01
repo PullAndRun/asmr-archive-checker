@@ -376,13 +376,43 @@ describe("配置与结果目录", () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-config-test-"));
     try {
       const configPath = join(root, "config.json");
-      await Bun.write(configPath, JSON.stringify({ archiveDir: "./archives", outputDir: "./results" }));
+      await Bun.write(configPath, JSON.stringify({
+        archiveDir: "./archives",
+        outputDir: "./results",
+        maxWorkers: 5,
+        maxRetries: 6,
+        proxyUrl: " http://127.0.0.1:7890 ",
+        syncQps: 2.5,
+      }));
       const config = await loadConfig({ mode: "archives", configPath, help: false });
       expect(config.archiveDir).toBe(resolve(root, "archives"));
       expect(config.outputDir).toBe(resolve(root, "results"));
+      expect(config).toMatchObject({
+        maxWorkers: 5,
+        maxRetries: 6,
+        proxyUrl: "http://127.0.0.1:7890",
+        syncQps: 2.5,
+      });
 
       await Bun.write(configPath, "[]");
       expect(loadConfig({ mode: "archives", configPath, help: false })).rejects.toThrow("根节点必须是 JSON 对象");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("拒绝无效的下载和 API 配置", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-config-validation-test-"));
+    try {
+      const configPath = join(root, "config.json");
+      const load = (values: object) => {
+        return Bun.write(configPath, JSON.stringify({ archiveDir: ".", ...values }))
+          .then(() => loadConfig({ mode: "archives", configPath, help: false }));
+      };
+      await expect(load({ maxWorkers: 0 })).rejects.toThrow("maxWorkers");
+      await expect(load({ maxRetries: -1 })).rejects.toThrow("maxRetries");
+      await expect(load({ proxyUrl: 123 })).rejects.toThrow("proxyUrl");
+      await expect(load({ syncQps: 0 })).rejects.toThrow("syncQps");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -463,6 +493,10 @@ describe("下载体积限制", () => {
       outputDir: "./output",
       sevenZipPath: "7z",
       concurrency: 1,
+      maxWorkers: 1,
+      maxRetries: 3,
+      proxyUrl: "",
+      syncQps: 2,
       requestTimeoutMs: 30_000,
       maxDownloadSize: "10 B",
       maxDownloadSizeBytes: 10,
@@ -493,6 +527,10 @@ describe("下载体积限制", () => {
       outputDir: "./output",
       sevenZipPath: "7z",
       concurrency: 1,
+      maxWorkers: 1,
+      maxRetries: 3,
+      proxyUrl: "",
+      syncQps: 2,
       requestTimeoutMs: 30_000,
       maxDownloadSize: "",
     };

@@ -17,7 +17,7 @@
 - [Bun](https://bun.sh/)；
 - 7-Zip，命令行可运行 `7z`。
 
-下载模式在所有平台都直接读取网站文件树，并下载其中的全部资源，不会在 MP3、WAV、FLAC 或其他资源之间做互斥筛选。文件响应以分块流直接写入磁盘，避免并发下载大文件时占用过多内存；文件名会经过安全清洗。如果项目下已有 `.asmroner-data/config.toml`，程序会复用其中的 `proxy_url`、`max_retries`、`max_workers` 和 `sync_qps`，但不再调用 `asmroner`，也不读取 `prefer_media`。每次下载的都是整部作品，不会只补缺失文件。
+下载模式在所有平台都直接读取网站文件树，并下载其中的全部资源，不会在 MP3、WAV、FLAC 或其他资源之间做互斥筛选。文件响应以分块流直接写入磁盘，避免并发下载大文件时占用过多内存；文件名会经过安全清洗。代理、重试、下载并发和 API 限速均通过项目的 `config.json` 配置。每次下载的都是整部作品，不会只补缺失文件。
 
 ## 日志
 
@@ -42,6 +42,10 @@ Copy-Item config.example.json config.json
   "sevenZipPath": "7z",
   "maxDownloadSize": "100 GB",
   "concurrency": 4,
+  "maxWorkers": 4,
+  "maxRetries": 3,
+  "proxyUrl": "",
+  "syncQps": 2,
   "requestTimeoutMs": 30000,
   "archiveTimeoutMs": 300000
 }
@@ -54,6 +58,10 @@ Copy-Item config.example.json config.json
 - `sevenZipPath`：7-Zip 命令或完整路径；
 - `maxDownloadSize`：单次运行允许完成下载的最大总体积，例如 `"100 GB"`。支持 B、KB、MB、GB、TB（按 1024 换算）；设为 `""` 表示不限制；
 - `concurrency`：API 和压缩包检查的并发数，范围 1–20；
+- `maxWorkers`：同一部作品内同时下载的最大文件数，范围 1–20；
+- `maxRetries`：单个文件下载失败后的最大重试次数，范围 0–20；
+- `proxyUrl`：API 和文件下载使用的代理地址；设为 `""` 表示不使用代理；
+- `syncQps`：API 请求速率上限，范围大于 0 且不超过 100；
 - `requestTimeoutMs`：单次 API 请求超时毫秒数。
 - `archiveTimeoutMs`：单个压缩包执行 7-Zip 列表检查的超时毫秒数，默认 300000（5 分钟）。
 

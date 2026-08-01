@@ -6,6 +6,10 @@
   "sevenZipPath": "7z",
   "maxDownloadSize": "100 GB",
   "concurrency": 4,
+  "maxWorkers": 4,
+  "maxRetries": 3,
+  "proxyUrl": "",
+  "syncQps": 2,
   "requestTimeoutMs": 30000,
   "archiveTimeoutMs": 300000
 }

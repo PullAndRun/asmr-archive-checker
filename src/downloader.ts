@@ -11,50 +11,10 @@ import { logger } from "./logger.ts";
 import type {
   Config,
   DownloadBatchResult,
-  DownloaderSettings,
   DownloadResult,
   DownloadTarget,
   RequestThrottle,
 } from "./types.ts";
-
-const parseTomlValue = (text: string, section: string, key: string): string | undefined => {
-  let currentSection = "";
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.replace(/\s+#.*$/, "").trim();
-    const sectionMatch = line.match(/^\[([^\]]+)]$/);
-    if (sectionMatch) {
-      currentSection = sectionMatch[1];
-      continue;
-    }
-    if (currentSection !== section) continue;
-    const valueMatch = line.match(new RegExp(`^${key}\\s*=\\s*(.+)$`));
-    if (valueMatch) return valueMatch[1].trim().replace(/^(['"])(.*)\1$/, "$2");
-  }
-  return undefined;
-};
-
-export async function readDownloaderSettings(workingDirectory: string, config: Config): Promise<DownloaderSettings> {
-  const defaults: DownloaderSettings = {
-    maxRetries: 3,
-    maxWorkers: config.concurrency,
-    proxyUrl: "",
-    requestTimeoutMs: config.requestTimeoutMs,
-    syncQps: 2,
-  };
-  const file = Bun.file(join(workingDirectory, ".asmroner-data", "config.toml"));
-  if (!(await file.exists())) return defaults;
-  const text = await file.text();
-  const maxRetries = Number.parseInt(parseTomlValue(text, "downloader", "max_retries") ?? "", 10);
-  const maxWorkers = Number.parseInt(parseTomlValue(text, "downloader", "max_workers") ?? "", 10);
-  const syncQps = Number.parseFloat(parseTomlValue(text, "limit", "sync_qps") ?? "");
-  return {
-    ...defaults,
-    ...(Number.isInteger(maxRetries) && maxRetries >= 0 ? { maxRetries: Math.min(maxRetries, 20) } : {}),
-    ...(Number.isInteger(maxWorkers) && maxWorkers > 0 ? { maxWorkers: Math.min(maxWorkers, 20) } : {}),
-    proxyUrl: parseTomlValue(text, "downloader", "proxy_url") || "",
-    ...(Number.isFinite(syncQps) && syncQps > 0 ? { syncQps: Math.min(syncQps, 100) } : {}),
-  };
-}
 
 export function isCompleteDownloadFile(actualSize: number, expectedSize?: number): boolean {
   return expectedSize === undefined || actualSize === expectedSize;
@@ -133,7 +93,7 @@ export async function writeResponseBodyToFile(
   }
 }
 
-const downloadFile = async (file: DownloadFile, root: string, settings: DownloaderSettings): Promise<"downloaded" | "skipped"> => {
+const downloadFile = async (file: DownloadFile, root: string, config: Config): Promise<"downloaded" | "skipped"> => {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(file.url);
@@ -153,20 +113,20 @@ const downloadFile = async (file: DownloadFile, root: string, settings: Download
     if (!existing.isFile()) throw new Error(`${file.relativePath}：目标路径存在但不是文件`);
   }
   let lastError: unknown;
-  for (let attempt = 0; attempt <= settings.maxRetries; attempt += 1) {
+  for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       if (attempt > 0) {
-        logger.warn(`重试 ${attempt}/${settings.maxRetries}：${file.relativePath}（${errorMessage(lastError)}）`);
+        logger.warn(`重试 ${attempt}/${config.maxRetries}：${file.relativePath}（${errorMessage(lastError)}）`);
         await Bun.sleep(Math.min(500 * 2 ** (attempt - 1), 4_000));
       }
       await rm(partialPath, { force: true });
-      timer = setTimeout(() => controller.abort(), settings.requestTimeoutMs);
+      timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
       const response = await fetch(file.url, {
         headers: { "User-Agent": "asmr-archive-checker/1.0" },
         signal: controller.signal,
-        ...(settings.proxyUrl ? { proxy: settings.proxyUrl } : {}),
+        ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
       });
       clearTimeout(timer);
       timer = undefined;
@@ -179,7 +139,7 @@ const downloadFile = async (file: DownloadFile, root: string, settings: Download
       if (file.size !== undefined && responseSize !== undefined && file.size !== responseSize) {
         throw new Error(`响应文件大小不符：预期 ${file.size}，响应声明 ${responseSize}`);
       }
-      await writeResponseBodyToFile(response, partialPath, controller, settings.requestTimeoutMs);
+      await writeResponseBodyToFile(response, partialPath, controller, config.requestTimeoutMs);
       const expectedSize = file.size ?? responseSize;
       if (expectedSize !== undefined) {
         const actualSize = (await stat(partialPath)).size;
@@ -229,18 +189,17 @@ const downloadWithBuiltin = async (
   workId: number,
   stagingPath: string,
   config: Config,
-  settings: DownloaderSettings,
 ): Promise<void> => {
-  const trackTree = await fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config.requestTimeoutMs, 4, settings.proxyUrl);
+  const trackTree = await fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config.requestTimeoutMs, 4, config.proxyUrl);
   if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
   const files = buildDownloadFilePlan(trackTree);
   if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
-  logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${settings.maxWorkers}`);
+  logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${config.maxWorkers}`);
   let finished = 0;
   let reused = 0;
-  const errors = await mapLimit(files, settings.maxWorkers, async (file) => {
+  const errors = await mapLimit(files, config.maxWorkers, async (file) => {
     try {
-      const status = await downloadFile(file, stagingPath, settings);
+      const status = await downloadFile(file, stagingPath, config);
       finished += 1;
       if (status === "skipped") reused += 1;
       logger.info(`[${finished}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);
@@ -257,7 +216,6 @@ const downloadWithBuiltin = async (
 const downloadWork = async (
   target: DownloadTarget,
   config: Config,
-  settings?: DownloaderSettings,
 ): Promise<DownloadResult> => {
   const { workId, displayId } = target;
   const targetPath = join(config.downloadDir, displayId);
@@ -280,7 +238,7 @@ const downloadWork = async (
     }
     stagingPath = await prepareStagingPath(stagingRoot, displayId);
     logger.info(`下载完整作品 ${displayId} ...`);
-    await downloadWithBuiltin(workId, stagingPath, config, settings ?? await readDownloaderSettings(resolve("."), config));
+    await downloadWithBuiltin(workId, stagingPath, config);
     if (await pathExists(targetPath)) throw new Error(`目标文件夹已存在：${targetPath}`);
     const size = await directorySize(stagingPath);
     await rename(stagingPath, targetPath);
@@ -304,11 +262,8 @@ export async function downloadWorks(
     const target = typeof input === "number" ? { workId: input, displayId: formatWorkId(input) } : input;
     return [`${target.workId}\0${target.displayId}`, { input, target }] as const;
   })).values()];
-  const settings = !downloadOne
-    ? await readDownloaderSettings(resolve("."), config)
-    : undefined;
   const run = (entry: typeof entries[number]): Promise<DownloadResult> => {
-    if (!downloadOne) return downloadWork(entry.target, config, settings);
+    if (!downloadOne) return downloadWork(entry.target, config);
     return typeof entry.input === "number"
       ? (downloadOne as NumericDownloadOne)(entry.input, config)
       : (downloadOne as TargetDownloadOne)(entry.input, config);
