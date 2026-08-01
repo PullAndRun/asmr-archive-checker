@@ -361,8 +361,9 @@ export function buildSearchUrl(author: string, page: number, pageSize = SEARCH_P
 }
 
 export function formatWorkId(id: number): string {
-  const width = id < 1_000_000 ? 6 : 8;
-  return `RJ${String(id).padStart(width, "0")}`;
+  const digits = String(id);
+  const prefix = digits.length === 7 ? "0" : "";
+  return `RJ${prefix}${digits}`;
 }
 
 export function buildWorkSearchUrl(id: number): string {
@@ -507,7 +508,7 @@ async function findDownloadedWorkFolders(root: string): Promise<Array<{ path: st
 }
 
 export function workIdFromArchiveName(path: string): number | undefined {
-  const match = basename(path).match(/RJ0*(\d+)/i);
+  const match = basename(path).match(/RJ(\d+)/i);
   if (!match) return undefined;
   const id = Number(match[1]);
   return Number.isSafeInteger(id) ? id : undefined;

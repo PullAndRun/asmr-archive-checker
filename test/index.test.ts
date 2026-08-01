@@ -74,18 +74,18 @@ describe("下载器调用", () => {
   test("复用旧版本中数据最多的随机临时目录", async () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-checker-test-"));
     try {
-      const smaller = join(root, "RJ00000001-small");
-      const larger = join(root, "RJ00000001-large");
+      const smaller = join(root, "RJ01000000-small");
+      const larger = join(root, "RJ01000000-large");
       await Promise.all([mkdir(smaller), mkdir(larger)]);
       await Promise.all([
         Bun.write(join(smaller, "file.txt"), "small"),
         Bun.write(join(larger, "file.txt"), "larger old download"),
       ]);
 
-      const selected = await prepareBuiltinStagingPath(root, "RJ00000001");
-      expect(selected).toBe(join(root, "RJ00000001"));
+      const selected = await prepareBuiltinStagingPath(root, "RJ01000000");
+      expect(selected).toBe(join(root, "RJ01000000"));
       expect(await Bun.file(join(selected, "file.txt")).text()).toBe("larger old download");
-      expect(await prepareBuiltinStagingPath(root, "RJ00000001")).toBe(selected);
+      expect(await prepareBuiltinStagingPath(root, "RJ01000000")).toBe(selected);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -112,12 +112,13 @@ describe("下载器调用", () => {
 });
 
 describe("编号识别", () => {
-  test("兼容有无前导零的 RJ 编号", () => {
+  test("读取旧文件名中的多余零并规范化为真实 RJ 编号", () => {
     expect(workIdFromArchiveName("RJ328352.7z")).toBe(328352);
-    expect(workIdFromArchiveName("RJ00328352.7z")).toBe(328352);
+    expect(workIdFromArchiveName("RJ00123.7z")).toBe(123);
     expect(workIdFromArchiveName("RJ1602072.7z")).toBe(1602072);
     expect(workIdFromArchiveName("作品-RJ01602072.7z")).toBe(1602072);
     expect(workIdFromArchiveName("no-id.7z")).toBeUndefined();
+    expect(formatWorkId(123)).toBe("RJ123");
   });
 });
 
@@ -166,7 +167,8 @@ describe("API 路径", () => {
     const newUrl = buildWorkSearchUrl(1602072);
     expect(decodeURIComponent(new URL(oldUrl).pathname)).toBe("/api/search/RJ328352");
     expect(decodeURIComponent(new URL(newUrl).pathname)).toBe("/api/search/RJ01602072");
-    expect(formatWorkId(1)).toBe("RJ000001");
+    expect(formatWorkId(1)).toBe("RJ1");
+    expect(formatWorkId(12345)).toBe("RJ12345");
     expect(formatWorkId(328352)).toBe("RJ328352");
     expect(formatWorkId(999999)).toBe("RJ999999");
     expect(formatWorkId(1000000)).toBe("RJ01000000");
@@ -337,13 +339,13 @@ describe("删除不完整作品", () => {
   test("只规划确认不完整且位于归档目录内的 7z", async () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-test-"));
     try {
-      const archivePath = join(root, "RJ00000001.7z");
+      const archivePath = join(root, "RJ01000000.7z");
       await Bun.write(archivePath, "incomplete archive");
       const plan = await buildDeletionPlan([
-        { archivePath, workId: 1, missingFiles: ["missing.wav"] },
-        { archivePath: join(root, "RJ00000002.7z"), workId: 2, missingFiles: [], error: "API 失败" },
+        { archivePath, workId: 1000000, missingFiles: ["missing.wav"] },
+        { archivePath: join(root, "RJ01000001.7z"), workId: 1000001, missingFiles: [], error: "API 失败" },
       ], root);
-      expect(plan).toEqual([{ archivePath, workId: 1, size: 18 }]);
+      expect(plan).toEqual([{ archivePath, workId: 1000000, size: 18 }]);
       expect(formatFileSize(plan[0].size)).toBe("18 B");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -353,10 +355,10 @@ describe("删除不完整作品", () => {
   test("删除计划中的文件", async () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-test-"));
     try {
-      const archivePath = join(root, "RJ00000001.7z");
+      const archivePath = join(root, "RJ01000000.7z");
       await Bun.write(archivePath, "x".repeat(2048));
       const plan = await buildDeletionPlan([
-        { archivePath, workId: 1, missingFiles: ["missing.wav"] },
+        { archivePath, workId: 1000000, missingFiles: ["missing.wav"] },
       ], root);
       expect(formatFileSize(plan[0].size)).toBe("2.00 KB");
       expect(await deleteArchives(plan)).toEqual([]);
@@ -370,10 +372,10 @@ describe("删除不完整作品", () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-delete-root-"));
     const outside = await mkdtemp(join(tmpdir(), "asmr-archive-delete-outside-"));
     try {
-      const archivePath = join(outside, "RJ00000001.7z");
+      const archivePath = join(outside, "RJ01000000.7z");
       await Bun.write(archivePath, "x");
       expect(buildDeletionPlan([
-        { archivePath, workId: 1, missingFiles: ["missing.wav"] },
+        { archivePath, workId: 1000000, missingFiles: ["missing.wav"] },
       ], root)).rejects.toThrow("archiveDir 之外");
     } finally {
       await Promise.all([
