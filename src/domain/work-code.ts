@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 
-export type WorkCode = `RJ${number}` | `BJ${number}`;
+export type WorkCode = `${string}J${number}`;
 export const MAX_RJ_ID = 99_999_999;
 
 export type WorkMetadata = {
@@ -18,13 +18,15 @@ export function formatWorkId(id: number): WorkCode {
 }
 
 export function normalizeWorkCode(value: string): WorkCode | undefined {
-  const match = value.trim().match(/^(RJ|BJ)(\d+)$/i);
+  const match = value.trim().match(/^([A-Z]J)(\d+)$/i);
   if (!match) return undefined;
   const id = Number(match[2]);
   if (!Number.isSafeInteger(id) || id < 1) return undefined;
-  return match[1].toUpperCase() === "RJ"
-    ? id <= MAX_RJ_ID ? formatWorkId(id) : undefined
-    : `BJ${id}` as WorkCode;
+  const prefix = match[1].toUpperCase();
+  if (prefix === "RJ" && id > MAX_RJ_ID) return undefined;
+  const digits = String(id);
+  const padding = digits.length === 7 ? "0" : "";
+  return `${prefix}${padding}${digits}` as WorkCode;
 }
 
 export function workCodeFromMetadata(work: WorkMetadata): WorkCode {
@@ -33,11 +35,11 @@ export function workCodeFromMetadata(work: WorkMetadata): WorkCode {
     if (!sourceCode) throw new Error(`API 返回了不支持的来源编号：${work.source_id}`);
     return sourceCode;
   }
-  return formatWorkId(work.id);
+  throw new Error(`API 没有返回内部 ID ${work.id} 的来源编号，无法确定作品前缀`);
 }
 
 export function workCodeFromArchiveName(path: string): WorkCode | undefined {
-  const match = basename(path).match(/(?:RJ|BJ)\d+/i);
+  const match = basename(path).match(/[A-Z]J\d+/i);
   return match ? normalizeWorkCode(match[0]) : undefined;
 }
 

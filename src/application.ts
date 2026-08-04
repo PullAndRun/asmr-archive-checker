@@ -114,7 +114,7 @@ const runCheck = async (
     : undefined;
 
   logger.info(`${mode === "author" ? `网站作品：${works.length} 个；` : ""}找到 7z：${archivePaths.length} 个；需要核对：${archivesToCheck.length} 个`);
-  if (unknownArchives.length > 0) logger.warn(`无法识别 RJ/BJ 编号的 7z：${unknownArchives.length} 个`);
+  if (unknownArchives.length > 0) logger.warn(`无法识别来源编号（*J）的 7z：${unknownArchives.length} 个`);
   const checked = await mapLimit(archivesToCheck, config.concurrency, async (archive, index) => {
     logger.info(`[${index + 1}/${archivesToCheck.length}] 检查 ${basename(archive.path)}`);
     return checkArchive(

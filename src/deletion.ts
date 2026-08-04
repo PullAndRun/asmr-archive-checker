@@ -128,7 +128,7 @@ export async function buildNonAuthorDeletionPlan(
     if (work.type === "压缩包" && (extname(targetPath).toLowerCase() !== ".7z" || !info.isFile())) {
       throw new Error(`删除目标不是普通 7z 文件：${targetPath}`);
     }
-    if (work.type === "文件夹" && (!/^(?:RJ|BJ)\d+$/i.test(basename(targetPath)) || !info.isDirectory())) {
+    if (work.type === "文件夹" && (!/^[A-Z]J\d+$/i.test(basename(targetPath)) || !info.isDirectory())) {
       throw new Error(`删除目标不是标准作品文件夹：${targetPath}`);
     }
     return {

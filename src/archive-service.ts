@@ -11,7 +11,7 @@ import type { Config, RequestThrottle } from "./types.ts";
 type ScanDirectory = { path: string; detectWorkFolders: boolean };
 type LocalTreeScan = { archives: string[]; folders: LocalWork[] };
 
-const isWorkFolderName = (name: string): boolean => /^(?:RJ|BJ)\d+$/i.test(name);
+const isWorkFolderName = (name: string): boolean => /^[A-Z]J\d+$/i.test(name);
 
 async function scanLocalTree(
   root: string,

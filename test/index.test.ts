@@ -199,11 +199,19 @@ describe("编号识别", () => {
     expect(formatWorkId(123)).toBe("RJ123");
   });
 
-  test("识别 BJ 来源编号而不把 API 内部 ID 伪装成 RJ", () => {
+  test("区分任意 *J 来源编号，不把 API 内部 ID 伪装成 RJ", () => {
     expect(normalizeWorkCode("bj0633449")).toBe("BJ633449");
     expect(workCodeFromArchiveName("作品-BJ633449.7z")).toBe("BJ633449");
     expect(workIdFromArchiveName("BJ633449.7z")).toBeUndefined();
     expect(workCodeFromSearchWork({ id: 100000007, source_id: "BJ633449" })).toBe("BJ633449");
+    expect(normalizeWorkCode("vj1005847")).toBe("VJ01005847");
+    expect(workCodeFromArchiveName("作品-VJ01005847.7z")).toBe("VJ01005847");
+    expect(workIdFromArchiveName("VJ01005847.7z")).toBeUndefined();
+    expect(workCodeFromSearchWork({ id: 100000063, source_id: "VJ01005847" })).toBe("VJ01005847");
+    expect(normalizeWorkCode("aj1005847")).toBe("AJ01005847");
+    expect(workCodeFromArchiveName("作品-AJ01005847.7z")).toBe("AJ01005847");
+    expect(() => formatWorkId(100000063)).toThrow("无效的 RJ 数字 ID");
+    expect(() => workCodeFromSearchWork({ id: 42 })).toThrow("无法确定作品前缀");
   });
 });
 
@@ -260,6 +268,7 @@ describe("API 路径", () => {
     expect(formatWorkId(1602072)).toBe("RJ01602072");
     expect(formatWorkId(1616933)).toBe("RJ01616933");
     expect(decodeURIComponent(new URL(buildWorkSearchUrl("BJ633449")).pathname)).toBe("/api/search/BJ633449");
+    expect(decodeURIComponent(new URL(buildWorkSearchUrl("VJ01005847")).pathname)).toBe("/api/search/VJ01005847");
   });
 });
 
@@ -335,8 +344,10 @@ describe("命令行参数", () => {
       "RJ01602072\t遗漏\t标题",
       "RJ01616933\t遗漏\t标题二",
       "BJ633449\t遗漏\t标题三",
+      "VJ01005847\t遗漏\t标题四",
+      "AJ01005847\t遗漏\t标题五",
       "",
-    ].join("\n"))).toEqual([1602072, 1616933, "BJ633449"]);
+    ].join("\n"))).toEqual([1602072, 1616933, "BJ633449", "VJ01005847", "AJ01005847"]);
   });
 
   test("拒绝空白或损坏的待下载汇总", () => {
@@ -474,18 +485,22 @@ describe("本地目录扫描", () => {
     try {
       const nested = join(root, "nested");
       const workFolder = join(nested, "RJ01000000");
-      await mkdir(workFolder, { recursive: true });
+      const otherWorkFolder = join(nested, "AJ01005847");
+      await Promise.all([mkdir(workFolder, { recursive: true }), mkdir(otherWorkFolder, { recursive: true })]);
       const archivePath = join(workFolder, "RJ01000001.7z");
       await Bun.write(archivePath, "archive");
       await Bun.write(join(nested, "ignored.zip"), "zip");
       expect(await findArchives(root)).toEqual([resolve(archivePath)]);
-      expect(await findDownloadedWorkFolders(root)).toEqual([{
-        path: resolve(workFolder),
-        workCode: "RJ01000000",
-      }]);
+      expect(await findDownloadedWorkFolders(root)).toEqual([
+        { path: resolve(otherWorkFolder), workCode: "AJ01005847" },
+        { path: resolve(workFolder), workCode: "RJ01000000" },
+      ]);
       expect(await scanLocalCollection(root)).toEqual({
         archives: [resolve(archivePath)],
-        folders: [{ path: resolve(workFolder), workCode: "RJ01000000" }],
+        folders: [
+          { path: resolve(otherWorkFolder), workCode: "AJ01005847" },
+          { path: resolve(workFolder), workCode: "RJ01000000" },
+        ],
       });
       expect(await findDownloadedWorkFolders(join(root, "missing"))).toEqual([]);
     } finally {
