@@ -5,6 +5,15 @@ import { errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type { Config, RequestThrottle, SearchResponse, SearchWork } from "./types.ts";
 
+export type AuthorSearchField = "circle" | "va";
+
+export function buildAuthorSearchKeywords(author: string): string[] {
+  const name = author.trim();
+  if (!name) throw new Error("作者名不能为空");
+  return (["circle", "va"] satisfies AuthorSearchField[])
+    .map((field) => `$${field}:${name}$`);
+}
+
 export function buildSearchUrl(author: string, page: number, pageSize = SEARCH_PAGE_SIZE): string {
   if (!Number.isSafeInteger(page) || page < 1) throw new Error(`搜索页码必须是正整数，实际为 ${page}`);
   if (!Number.isSafeInteger(pageSize) || pageSize < 1) throw new Error(`每页数量必须是正整数，实际为 ${pageSize}`);
@@ -117,7 +126,21 @@ export async function fetchAllWorks(
   throttle?: RequestThrottle,
 ): Promise<SearchWork[]> {
   logger.info(`正在读取作者作品列表${config.proxyUrl ? "（使用代理）" : ""}...`);
-  const first = await fetchJson<SearchResponse>(buildSearchUrl(config.author, 1), config, throttle);
+  const searches = buildAuthorSearchKeywords(config.author);
+  const works: SearchWork[] = [];
+  for (const keyword of searches) {
+    works.push(...await fetchWorksByKeyword(keyword, config, throttle));
+  }
+  return [...new Map(works.map((work) => [work.id, work])).values()]
+    .toSorted((left, right) => right.id - left.id);
+}
+
+async function fetchWorksByKeyword(
+  keyword: string,
+  config: Config,
+  throttle?: RequestThrottle,
+): Promise<SearchWork[]> {
+  const first = await fetchJson<SearchResponse>(buildSearchUrl(keyword, 1), config, throttle);
   validateSearchResponse(first);
   if (first.pagination.currentPage !== 1) {
     throw new Error(`作品列表 API 返回了错误页码：请求 1，返回 ${first.pagination.currentPage}`);
@@ -127,7 +150,7 @@ export async function fetchAllWorks(
   const pages = Array.from({ length: totalPages - 1 }, (_, index) => index + 2);
   const responses = await mapLimit(pages, config.concurrency, async (page) => {
     logger.info(`正在读取作者作品列表：${page}/${totalPages}`);
-    const response = await fetchJson<SearchResponse>(buildSearchUrl(config.author, page), config, throttle);
+    const response = await fetchJson<SearchResponse>(buildSearchUrl(keyword, page), config, throttle);
     validateSearchResponse(response);
     if (response.pagination.currentPage !== page) {
       throw new Error(`作品列表 API 返回了错误页码：请求 ${page}，返回 ${response.pagination.currentPage}`);

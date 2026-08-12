@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   buildDownloadFilePlan,
+  buildAuthorSearchKeywords,
   buildDeletionPlan,
   buildDeletionQueue,
   buildNonAuthorDeletionPlan,
@@ -249,10 +250,20 @@ describe("非该作者作品清单", () => {
 });
 
 describe("API 路径", () => {
-  test("author 原样作为网站搜索 keyword 编码", () => {
-    const url = buildSearchUrl("示例作者", 2, 20);
-    expect(decodeURIComponent(new URL(url).pathname)).toBe("/api/search/示例作者");
+  test("author 只生成 circle 和 va 精确搜索词", () => {
+    expect(buildAuthorSearchKeywords(" 稻草人 ")).toEqual([
+      "$circle:稻草人$",
+      "$va:稻草人$",
+    ]);
+    expect(() => buildAuthorSearchKeywords("  ")).toThrow("作者名不能为空");
+  });
+
+  test("作者字段搜索词按网站 keyword 编码", () => {
+    const [circle, va] = buildAuthorSearchKeywords("水澤あむ");
+    const url = buildSearchUrl(circle, 2, 20);
+    expect(decodeURIComponent(new URL(url).pathname)).toBe("/api/search/$circle:水澤あむ$");
     expect(new URL(url).searchParams.get("page")).toBe("2");
+    expect(decodeURIComponent(new URL(buildSearchUrl(va, 1)).pathname)).toBe("/api/search/$va:水澤あむ$");
   });
 
   test("作品编号按新旧格式精确搜索", () => {

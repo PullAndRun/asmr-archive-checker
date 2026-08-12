@@ -51,7 +51,7 @@ Copy-Item config.example.json config.json
 }
 ```
 
-- `author`：`author` 模式使用的搜索关键词，即 `https://asmr.one/works?keyword=...` 中的 `keyword`；
+- `author`：`author` 模式使用的社团或声优名称。程序只会分别按 asmr.one 的精确 `circle` 和 `va` 字段搜索，即 `$circle:名称$`、`$va:名称$`，并合并去重两边的作品；
 - `archiveDir`：递归扫描 7z 的目录；
 - `downloadDir`：完整作品保存目录。`download` 模式要求明确填写，`delete-non-author` 也会将其作为允许删除作品文件夹的目录；
 - `outputDir`：检查结果和待下载汇总所在目录；
@@ -75,7 +75,7 @@ Copy-Item config.example.json config.json
 
 ### 批量下载某位作者的音声
 
-在 `config.json` 中填写 `author`、`archiveDir` 和 `downloadDir`。先获取该作者的作品列表，并与本地已有的 7z 和已下载文件夹进行比较：
+在 `config.json` 中填写社团或声优名称 `author`、`archiveDir` 和 `downloadDir`。程序会分别搜索同名 `circle` 和 `va`，再将作品列表与本地已有的 7z 和已下载文件夹进行比较：
 
 ```powershell
 bun run author
