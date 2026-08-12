@@ -38,6 +38,7 @@ import {
   prepareStagingPath,
   replaceOutputDirectory,
   retryAfterMilliseconds,
+  retryDelayMilliseconds,
   scanLocalCollection,
   sanitizeDownloadPathSegment,
   normalizeWorkCode,
@@ -659,6 +660,14 @@ describe("API 请求", () => {
     expect(retryAfterMilliseconds("999")).toBe(60_000);
     expect(isRetryableRequestError(httpErrorFromResponse(new Response(null, { status: 404 })))).toBeFalse();
     expect(isRetryableRequestError(httpErrorFromResponse(new Response(null, { status: 429 })))).toBeTrue();
+  });
+
+  test("没有 Retry-After 的 429 使用较长的指数退避", () => {
+    const tooManyRequests = httpErrorFromResponse(new Response(null, { status: 429 }));
+    expect(retryDelayMilliseconds(tooManyRequests, 1, 60_000)).toBe(5_000);
+    expect(retryDelayMilliseconds(tooManyRequests, 2, 60_000)).toBe(10_000);
+    expect(retryDelayMilliseconds(tooManyRequests, 5, 60_000)).toBe(60_000);
+    expect(retryDelayMilliseconds(new Error("network"), 1, 60_000)).toBe(500);
   });
 });
 

@@ -32,5 +32,6 @@ export function isRetryableRequestError(error: unknown): boolean {
 
 export function retryDelayMilliseconds(error: unknown, failedAttempt: number, maximumBackoffMs = 8_000): number {
   if (isHttpResponseError(error) && error.retryAfterMs !== undefined) return error.retryAfterMs;
-  return Math.min(500 * 2 ** Math.max(0, failedAttempt - 1), maximumBackoffMs);
+  const initialDelayMs = isHttpResponseError(error) && error.status === 429 ? 5_000 : 500;
+  return Math.min(initialDelayMs * 2 ** Math.max(0, failedAttempt - 1), maximumBackoffMs);
 }

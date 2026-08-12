@@ -174,7 +174,7 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
       }
       controller.abort();
       if (attempt < config.maxRetries && isRetryableRequestError(requestError)) {
-        const delayMs = retryDelayMilliseconds(requestError, attempt + 1, 4_000);
+        const delayMs = retryDelayMilliseconds(requestError, attempt + 1, 60_000);
         logger.warn(`下载失败（${attempt + 1}/${config.maxRetries + 1}）：${file.relativePath}（${errorMessage(requestError)}）；${delayMs} 毫秒后重试`);
         await Bun.sleep(delayMs);
       } else if (!isRetryableRequestError(requestError)) {
