@@ -51,7 +51,7 @@ Copy-Item config.example.json config.json
 }
 ```
 
-- `author`：`author` 模式使用的作者名；
+- `author`：`author` 模式使用的搜索关键词，即 `https://asmr.one/works?keyword=...` 中的 `keyword`；
 - `archiveDir`：递归扫描 7z 的目录；
 - `downloadDir`：完整作品保存目录。`download` 模式要求明确填写，`delete-non-author` 也会将其作为允许删除作品文件夹的目录；
 - `outputDir`：检查结果和待下载汇总所在目录；

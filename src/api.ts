@@ -8,8 +8,7 @@ import type { Config, RequestThrottle, SearchResponse, SearchWork } from "./type
 export function buildSearchUrl(author: string, page: number, pageSize = SEARCH_PAGE_SIZE): string {
   if (!Number.isSafeInteger(page) || page < 1) throw new Error(`搜索页码必须是正整数，实际为 ${page}`);
   if (!Number.isSafeInteger(pageSize) || pageSize < 1) throw new Error(`每页数量必须是正整数，实际为 ${pageSize}`);
-  const expression = ` $va:${author}$`;
-  const url = new URL(`/api/search/${encodeURIComponent(expression)}`, API_BASE_URL);
+  const url = new URL(`/api/search/${encodeURIComponent(author)}`, API_BASE_URL);
   url.searchParams.set("order", "create_date");
   url.searchParams.set("sort", "desc");
   url.searchParams.set("page", String(page));

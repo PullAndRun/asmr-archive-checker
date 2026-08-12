@@ -249,9 +249,9 @@ describe("非该作者作品清单", () => {
 });
 
 describe("API 路径", () => {
-  test("作者表达式被正确编码", () => {
+  test("author 原样作为网站搜索 keyword 编码", () => {
     const url = buildSearchUrl("示例作者", 2, 20);
-    expect(decodeURIComponent(new URL(url).pathname)).toBe("/api/search/ $va:示例作者$");
+    expect(decodeURIComponent(new URL(url).pathname)).toBe("/api/search/示例作者");
     expect(new URL(url).searchParams.get("page")).toBe("2");
   });
 
