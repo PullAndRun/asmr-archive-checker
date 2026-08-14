@@ -26,12 +26,24 @@ export function isHttpResponseError(error: unknown): error is HttpResponseError 
   return error instanceof HttpResponseError;
 }
 
+export function findHttpResponseError(error: unknown): HttpResponseError | undefined {
+  const visited = new Set<unknown>();
+  let current = error;
+  while (current instanceof Error && !visited.has(current)) {
+    if (isHttpResponseError(current)) return current;
+    visited.add(current);
+    current = current.cause;
+  }
+  return undefined;
+}
+
 export function isRetryableRequestError(error: unknown): boolean {
   return !isHttpResponseError(error) || error.status === 408 || error.status === 429 || error.status >= 500;
 }
 
 export function retryDelayMilliseconds(error: unknown, failedAttempt: number, maximumBackoffMs = 8_000): number {
   if (isHttpResponseError(error) && error.retryAfterMs !== undefined) return error.retryAfterMs;
-  const initialDelayMs = isHttpResponseError(error) && error.status === 429 ? 5_000 : 500;
+  const status = isHttpResponseError(error) ? error.status : undefined;
+  const initialDelayMs = status === 429 || status === 502 || status === 503 || status === 504 ? 5_000 : 500;
   return Math.min(initialDelayMs * 2 ** Math.max(0, failedAttempt - 1), maximumBackoffMs);
 }

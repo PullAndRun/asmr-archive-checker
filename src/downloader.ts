@@ -6,7 +6,7 @@ import { buildDownloadFilePlan, type DownloadFile, type TrackNode } from "./doma
 import { formatFileSize, hasReachedDownloadSizeLimit } from "./domain/size.ts";
 import { formatWorkId } from "./domain/work-code.ts";
 import { directorySize, pathExists } from "./fs-utils.ts";
-import { httpErrorFromResponse, isRetryableRequestError, retryDelayMilliseconds } from "./http.ts";
+import { findHttpResponseError, httpErrorFromResponse, isRetryableRequestError, retryDelayMilliseconds } from "./http.ts";
 import { containsPath, errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type {
@@ -186,7 +186,7 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
     }
   }
   await rm(partialPath, { force: true }).catch(() => undefined);
-  throw new Error(`${file.relativePath}：${errorMessage(lastError)}`);
+  throw new Error(`${file.relativePath}：${errorMessage(lastError)}`, { cause: lastError });
 };
 
 export async function prepareStagingPath(stagingRoot: string, displayId: string): Promise<string> {
@@ -233,6 +233,7 @@ const downloadWithBuiltin = async (
       logger.info(`[${processed}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);
       return undefined;
     } catch (error) {
+      if (findHttpResponseError(error)?.status === 503) throw error;
       const message = errorMessage(error);
       processed += 1;
       logger.warn(`[${processed}/${files.length}] 失败 ${file.relativePath}：${message}`);
@@ -275,6 +276,9 @@ const downloadWork = async (
     await rename(stagingPath, targetPath);
     return { workId, displayId, status: "downloaded", targetPath, size };
   } catch (error) {
+    if (findHttpResponseError(error)?.status === 503) {
+      throw new Error(`作品 ${displayId}：${errorMessage(error)}`, { cause: error });
+    }
     return { workId, displayId, status: "failed", stagingPath, error: errorMessage(error) };
   }
 };
@@ -299,25 +303,33 @@ export async function downloadWorks(
       ? (downloadOne as NumericDownloadOne)(entry.input, config)
       : (downloadOne as TargetDownloadOne)(entry.input, config);
   };
-  const runSafely = async (entry: typeof entries[number]): Promise<DownloadResult> => {
+  const runSafely = async (entry: typeof entries[number]): Promise<{
+    result: DownloadResult;
+    serviceUnavailable: boolean;
+  }> => {
     try {
-      return await run(entry);
+      return { result: await run(entry), serviceUnavailable: false };
     } catch (error) {
       return {
-        ...entry.target,
-        status: "failed",
-        error: errorMessage(error),
+        result: {
+          ...entry.target,
+          status: "failed",
+          error: errorMessage(error),
+        },
+        serviceUnavailable: findHttpResponseError(error)?.status === 503,
       };
     }
   };
   const results: DownloadResult[] = [];
   let downloadedSize = 0;
   let stoppedByLimit = false;
+  let stoppedByServiceUnavailable = false;
   let attemptedCount = 0;
   let pendingRetryCount = 0;
   for (const [index, entry] of entries.entries()) {
     logger.info(`[作品 ${index + 1}/${entries.length}] ${entry.target.displayId}`);
-    const result = await runSafely(entry);
+    const outcome = await runSafely(entry);
+    const result = outcome.result;
     results.push(result);
     attemptedCount += 1;
     if (result.status === "downloaded") {
@@ -331,15 +343,23 @@ export async function downloadWorks(
         break;
       }
     } else if (result.status === "skipped") logger.info(`作品已存在，跳过：${result.displayId}`);
-    else logger.error(`作品失败：${result.displayId}：${result.error}`);
+    else {
+      logger.error(`作品失败：${result.displayId}：${result.error}`);
+      if (outcome.serviceUnavailable) {
+        stoppedByServiceUnavailable = true;
+        logger.warn("资源服务器持续返回 HTTP 503，已停止本轮下载；临时文件已保留，稍后重新运行可继续下载。");
+        break;
+      }
+    }
   }
   const failedIndexes = results.flatMap((result, index) => result.status === "failed" ? [index] : []);
-  if (!stoppedByLimit && failedIndexes.length > 0) {
+  if (!stoppedByLimit && !stoppedByServiceUnavailable && failedIndexes.length > 0) {
     logger.warn(`首轮有 ${failedIndexes.length} 部作品失败，开始续传重试。`);
     for (const [retryIndex, resultIndex] of failedIndexes.entries()) {
       const entry = entries[resultIndex];
       logger.info(`[重试 ${retryIndex + 1}/${failedIndexes.length}] ${entry.target.displayId}`);
-      const result = await runSafely(entry);
+      const outcome = await runSafely(entry);
+      const result = outcome.result;
       results[resultIndex] = result;
       if (result.status === "downloaded") {
         downloadedSize += result.size ?? 0;
@@ -359,6 +379,12 @@ export async function downloadWorks(
         logger.info(`作品已存在，跳过：${result.displayId}`);
       } else {
         logger.error(`重试失败：${result.displayId}：${result.error}`);
+        if (outcome.serviceUnavailable) {
+          stoppedByServiceUnavailable = true;
+          pendingRetryCount = failedIndexes.length - retryIndex - 1;
+          logger.warn("资源服务器持续返回 HTTP 503，已停止本轮下载；临时文件已保留，稍后重新运行可继续下载。");
+          break;
+        }
       }
     }
   }
@@ -367,6 +393,7 @@ export async function downloadWorks(
     results,
     downloadedSize,
     stoppedByLimit,
+    stoppedByServiceUnavailable,
     remainingCount: unattemptedCount + pendingRetryCount,
   };
 }

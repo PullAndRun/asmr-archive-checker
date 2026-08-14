@@ -70,6 +70,9 @@ const runDownload = async (config: Config): Promise<void> => {
     `下载体积 ${formatFileSize(batch.downloadedSize)}。`,
   );
   if (batch.stoppedByLimit && batch.remainingCount > 0) logger.info(`因达到体积限制停止，队列中还有 ${batch.remainingCount} 部作品未开始。`);
+  if (batch.stoppedByServiceUnavailable && batch.remainingCount > 0) {
+    logger.warn(`因资源服务器不可用停止，队列中还有 ${batch.remainingCount} 部作品未开始。`);
+  }
   if (downloads.some((item) => item.status === "failed")) process.exitCode = 2;
 };
 

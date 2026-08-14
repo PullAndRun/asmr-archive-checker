@@ -600,6 +600,35 @@ describe("下载体积限制", () => {
     expect(attempts).toBe(2);
     expect(batch.results).toMatchObject([{ status: "failed", error: "执行器崩溃" }]);
   });
+
+  test("资源服务器持续返回 503 时停止后续作品", async () => {
+    const config = {
+      author: "",
+      archiveDir: ".",
+      downloadDir: ".",
+      outputDir: "./output",
+      sevenZipPath: "7z",
+      concurrency: 1,
+      maxWorkers: 1,
+      maxRetries: 3,
+      proxyUrl: "",
+      syncQps: 2,
+      requestTimeoutMs: 30_000,
+      maxDownloadSize: "",
+    };
+    const started: number[] = [];
+    const batch = await downloadWorks([1, 2, 3], config, async (workId) => {
+      started.push(workId);
+      throw new Error("资源下载失败", {
+        cause: httpErrorFromResponse(new Response(null, { status: 503 })),
+      });
+    });
+
+    expect(started).toEqual([1]);
+    expect(batch.stoppedByServiceUnavailable).toBeTrue();
+    expect(batch.remainingCount).toBe(2);
+    expect(batch.results).toMatchObject([{ status: "failed", error: "资源下载失败" }]);
+  });
 });
 
 describe("API 请求", () => {
@@ -662,11 +691,14 @@ describe("API 请求", () => {
     expect(isRetryableRequestError(httpErrorFromResponse(new Response(null, { status: 429 })))).toBeTrue();
   });
 
-  test("没有 Retry-After 的 429 使用较长的指数退避", () => {
+  test("没有 Retry-After 的限流和网关错误使用较长的指数退避", () => {
     const tooManyRequests = httpErrorFromResponse(new Response(null, { status: 429 }));
+    const serviceUnavailable = httpErrorFromResponse(new Response(null, { status: 503 }));
     expect(retryDelayMilliseconds(tooManyRequests, 1, 60_000)).toBe(5_000);
     expect(retryDelayMilliseconds(tooManyRequests, 2, 60_000)).toBe(10_000);
     expect(retryDelayMilliseconds(tooManyRequests, 5, 60_000)).toBe(60_000);
+    expect(retryDelayMilliseconds(serviceUnavailable, 1, 60_000)).toBe(5_000);
+    expect(retryDelayMilliseconds(serviceUnavailable, 3, 60_000)).toBe(20_000);
     expect(retryDelayMilliseconds(new Error("network"), 1, 60_000)).toBe(500);
   });
 });

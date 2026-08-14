@@ -73,5 +73,6 @@ export type DownloadBatchResult = {
   results: DownloadResult[];
   downloadedSize: number;
   stoppedByLimit: boolean;
+  stoppedByServiceUnavailable: boolean;
   remainingCount: number;
 };
