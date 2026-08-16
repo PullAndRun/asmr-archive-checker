@@ -1,4 +1,4 @@
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { createRequestThrottle, fetchAllWorks, workCodeFromSearchWork } from "./api.ts";
 import { checkArchive, classifyArchives, findArchives, findDownloadedWorkFolders, scanLocalCollection } from "./archive-service.ts";
 import { ensureDirectory, loadConfig, parseArgs, requireDirectory, usage, validateOutputDirectory } from "./config.ts";
@@ -80,26 +80,40 @@ const runCheck = async (
   mode: "author" | "archives",
   config: Config,
 ): Promise<void> => {
-  await requireDirectory(config.archiveDir, "archiveDir");
+  await Promise.all([
+    requireDirectory(config.archiveDir, "archiveDir"),
+    requireDirectory(config.asmrDir, "asmrDir"),
+  ]);
   validateOutputDirectory(config);
   logger.info(`模式：${mode}`);
   if (mode === "author") logger.info(`作者：${config.author}`);
   logger.info(`7z 目录：${config.archiveDir}`);
+  logger.info(`ASMR 资料库：${config.asmrDir}`);
 
   const extraFolderRoots = mode === "author"
     ? [...new Set([config.downloadDir].filter((root) => root && root !== config.archiveDir))]
     : [];
-  const [localCollection, extraFolderGroups] = await Promise.all([
+  const [localCollection, extraFolderGroups, savedArchivePaths] = await Promise.all([
     mode === "author"
       ? scanLocalCollection(config.archiveDir)
       : findArchives(config.archiveDir).then((archives) => ({ archives, folders: [] })),
     Promise.all(extraFolderRoots.map(findDownloadedWorkFolders)),
+    findArchives(config.asmrDir),
   ]);
   const archivePaths = localCollection.archives;
   const downloadedFolders = [...new Map(
     [localCollection.folders, ...extraFolderGroups].flat().map((folder) => [folder.path, folder]),
   ).values()];
   const { recognized: recognizedArchives, unknown: unknownArchives } = classifyArchives(archivePaths);
+  const checkedPathKeys = new Set(archivePaths.map((path) => {
+    const key = resolve(path);
+    return process.platform === "win32" ? key.toLowerCase() : key;
+  }));
+  const { recognized: allSavedArchives, unknown: unknownSavedArchives } = classifyArchives(savedArchivePaths);
+  const savedArchives = allSavedArchives.filter((archive) => {
+    const key = resolve(archive.path);
+    return !checkedPathKeys.has(process.platform === "win32" ? key.toLowerCase() : key);
+  });
   const apiThrottle = createRequestThrottle(config.syncQps);
   logger.info(`API 请求速率：每秒最多 ${config.syncQps} 次`);
   const works = mode === "author" ? await fetchAllWorks(config, apiThrottle) : [];
@@ -116,8 +130,9 @@ const runCheck = async (
     ? findNonAuthorWorks(websiteCodes, recognizedArchives, downloadedFolders)
     : undefined;
 
-  logger.info(`${mode === "author" ? `网站作品：${works.length} 个；` : ""}找到 7z：${archivePaths.length} 个；需要核对：${archivesToCheck.length} 个`);
+  logger.info(`${mode === "author" ? `网站作品：${works.length} 个；` : ""}找到 7z：${archivePaths.length} 个；ASMR 资料库已有：${new Set(allSavedArchives.map(workCodeOf)).size} 部；需要核对：${archivesToCheck.length} 个`);
   if (unknownArchives.length > 0) logger.warn(`无法识别来源编号（*J）的 7z：${unknownArchives.length} 个`);
+  if (unknownSavedArchives.length > 0) logger.warn(`ASMR 资料库中无法识别来源编号（*J）的 7z：${unknownSavedArchives.length} 个`);
   const checked = await mapLimit(archivesToCheck, config.concurrency, async (archive, index) => {
     logger.info(`[${index + 1}/${archivesToCheck.length}] 检查 ${basename(archive.path)}`);
     return checkArchive(
@@ -137,11 +152,13 @@ const runCheck = async (
       incomplete,
       downloadedFolders,
       nonAuthorWorks,
+      savedArchives,
     );
   });
   const downloadedCodes = new Set([
     ...recognizedArchives.map(workCodeOf),
     ...downloadedFolders.map(workCodeOf),
+    ...savedArchives.map(workCodeOf),
   ]);
   const missingCount = works.filter((work) => !downloadedCodes.has(workCodeFromSearchWork(work))).length;
   logger.info(`完成：不完整压缩包 ${incomplete.length} 个，遗漏下载作品 ${missingCount} 个。`);

@@ -107,9 +107,11 @@ export async function writeResults(
   incomplete: IncompleteArchive[],
   downloadedFolders: LocalWork[],
   nonAuthorWorks?: NonAuthorWork[],
+  savedArchives: LocalWork[] = [],
 ): Promise<void> {
   await mkdir(config.outputDir, { recursive: true });
-  const downloadedCodes = new Set([...recognizedArchives, ...downloadedFolders].map(workCodeOf));
+  const savedCodes = new Set(savedArchives.map(workCodeOf));
+  const downloadedCodes = new Set([...recognizedArchives, ...downloadedFolders, ...savedArchives].map(workCodeOf));
   const missingWorks = works.filter((work) => !downloadedCodes.has(workCodeFromMetadata(work)));
   const missingLines = [
     "作品ID\t标题\t发布日期",
@@ -120,6 +122,7 @@ export async function writeResults(
   const queue = new Map<string, string>();
   incomplete.forEach((item) => {
     const workCode = workCodeOf(item);
+    if (savedCodes.has(workCode)) return;
     queue.set(workCode, `${workCode}\t${item.error ? "检查失败" : "不完整"}\t${sanitizeColumn(item.archivePath)}`);
   });
   missingWorks.forEach((work) => {

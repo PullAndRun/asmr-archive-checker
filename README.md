@@ -37,6 +37,7 @@ Copy-Item config.example.json config.json
 {
   "author": "作者名",
   "archiveDir": "D:/path/to/archives",
+  "asmrDir": "D:/path/to/asmr",
   "downloadDir": "D:/path/to/downloads",
   "outputDir": "./output",
   "sevenZipPath": "7z",
@@ -53,6 +54,7 @@ Copy-Item config.example.json config.json
 
 - `author`：`author` 模式使用的社团或声优名称。程序只会分别按 asmr.one 的精确 `circle` 和 `va` 字段搜索，即 `$circle:名称$`、`$va:名称$`，并合并去重两边的作品；
 - `archiveDir`：递归扫描 7z 的目录；
+- `asmrDir`：保存已下载音声压缩包的资料库根目录。目录下可按任意作者分文件夹，程序会递归全局查找所有能识别 `*J` 编号的 `.7z`，不依赖当前 `author` 的目录名；
 - `downloadDir`：完整作品保存目录。`download` 模式要求明确填写，`delete-non-author` 也会将其作为允许删除作品文件夹的目录；
 - `outputDir`：检查结果和待下载汇总所在目录；
 - `sevenZipPath`：7-Zip 命令或完整路径；
@@ -62,20 +64,20 @@ Copy-Item config.example.json config.json
 - `maxRetries`：API 或单个文件请求失败后的最大重试次数，范围 0–20；
 - `proxyUrl`：API 和文件下载使用的代理地址；设为 `""` 表示不使用代理；
 - `syncQps`：API 请求速率上限，范围大于 0 且不超过 100；
-- `requestTimeoutMs`：API 请求以及文件下载连接/无数据等待的超时毫秒数。
+- `requestTimeoutMs`：API 请求以及每个文件分段的连接/无数据等待超时毫秒数。
 - `archiveTimeoutMs`：单个压缩包执行 7-Zip 列表检查的超时毫秒数，默认 300000（5 分钟）。
 
 相对路径均以配置文件所在目录为基准。
 
 每次运行都会清理 `outputDir` 中的其他文件。`archives` 检查生成四个结果文件，`author` 还会额外生成非该作者作品清单；下载模式会先读取并保留这些结果文件，再清理其他内容。安全校验会阻止把 `outputDir` 配置为磁盘根目录、项目目录、音声目录或其上级目录。
 
-程序启动时会先只读检查 `archiveDir`。如果待扫描目录不存在或不是文件夹，程序会立即报错，不会创建该目录、清空 `outputDir`、请求 API 或执行其他操作。验证通过后才会创建 `outputDir`。下载模式会自动创建缺失的 `outputDir`、`downloadDir` 和下载临时目录。
+`author` 和 `archives` 启动时会先只读检查 `archiveDir` 和 `asmrDir`。如果待扫描目录不存在或不是文件夹，程序会立即报错，不会创建该目录、清空 `outputDir`、请求 API 或执行其他操作。项目内已提供空的 `./asmr` 目录；使用其他资料库时请修改配置。验证通过后才会创建 `outputDir`。下载模式会自动创建缺失的 `outputDir`、`downloadDir` 和下载临时目录。
 
 ## 运行流程
 
 ### 批量下载某位作者的音声
 
-在 `config.json` 中填写社团或声优名称 `author`、`archiveDir` 和 `downloadDir`。程序会分别搜索同名 `circle` 和 `va`，再将作品列表与本地已有的 7z 和已下载文件夹进行比较：
+在 `config.json` 中填写社团或声优名称 `author`、`archiveDir`、`asmrDir` 和 `downloadDir`。程序会分别搜索同名 `circle` 和 `va`，再将作品列表与本地已有的 7z、ASMR 资料库和已下载文件夹进行比较：
 
 ```powershell
 bun run author
@@ -87,7 +89,7 @@ bun run author
 bun run download
 ```
 
-因此，已有的完整作品不会被重复下载；如果 `archiveDir` 和 `downloadDir` 中都没有该作者的作品，队列会包含检索到的全部作品，可用于整批下载。
+因此，同一作品即使属于多个作者，只要它的压缩包存在于 `asmrDir` 下任意作者目录，就不会被重复加入待下载队列。`archiveDir` 中本次确认不完整、且资料库中没有另一份压缩包的作品仍会保留在队列中，以便重新下载。
 
 ### 分步使用
 
@@ -147,6 +149,7 @@ bun run download -- --max-download-size "100 GB"
 ```powershell
 bun run author -- --author "作者名" --dir "D:\音声\作者"
 bun run archives -- --dir "D:\音声\待检查" --output "D:\检查结果"
+bun run author -- --asmr-dir "D:\asmr"
 ```
 
 其他选项可通过 `bun run check -- --help` 查看。`bun run check` 默认等同于 `author` 模式。
@@ -161,8 +164,10 @@ bun run archives -- --dir "D:\音声\待检查" --output "D:\检查结果"
 - 比较时优先匹配完整相对路径；若目录名被清理过，再按尚未匹配的文件名和重复数量核对；
 - 网站列出的任何文件缺失都会判为不完整；压缩包内的额外文件不影响结果；
 - 待下载汇总会把遗漏作品和不完整作品按编号去重；
+- `author` 和 `archives` 都会递归扫描整个 `asmrDir`，并按作品编号从待下载汇总中剔除资料库任意作者目录下已有的 `.7z`；
 - `author` 模式会把作者作品列表之外、且能从名称识别 `*J` 来源编号的本地压缩包和作品文件夹写入单独清单；
 - `download` 模式逐行读取汇总，下载完整作品；
+- 文件资源使用 8 MiB 的有界 HTTP Range 分段下载；每段独立校验 `Content-Range`、声明大小和实际大小，临时错误只重试当前分段；不支持 Range 的普通服务器仍可返回一次完整的 `200` 响应；
 - 设置下载体积限制后，每部作品完成时累计其文件夹体积；达到限制后停止开始下一部作品，不会切断当前作品；
 - 下载先进入 `downloadDir/.asmr-archive-checker-downloads` 下的临时目录，成功后移动并改名为真实来源编号；Windows 非法文件名字符会替换为 `_`；
 - 标准名称的目标文件夹已经存在时会跳过，不覆盖已有文件；失败时保留每部作品固定的临时目录，再次运行会校验文件大小并续传尚未完成的文件。旧版本生成的随机临时目录也会自动选择数据最多的一份继续下载。

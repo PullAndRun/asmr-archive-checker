@@ -4,6 +4,7 @@ import type { WorkCode, WorkReference } from "./domain/work-code.ts";
 export type Config = {
   author: string;
   archiveDir: string;
+  asmrDir: string;
   downloadDir: string;
   outputDir: string;
   sevenZipPath: string;
@@ -25,6 +26,7 @@ export type CliOptions = {
   configPath?: string;
   author?: string;
   archiveDir?: string;
+  asmrDir?: string;
   outputDir?: string;
   downloadDir?: string;
   sevenZipPath?: string;

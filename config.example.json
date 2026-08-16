@@ -1,6 +1,7 @@
 {
   "author": "作者名",
   "archiveDir": "D:/path/to/archives",
+  "asmrDir": "D:/path/to/asmr",
   "downloadDir": "D:/path/to/downloads",
   "outputDir": "./output",
   "sevenZipPath": "7z",

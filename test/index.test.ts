@@ -13,6 +13,8 @@ import {
   createRequestThrottle,
   deleteArchives,
   deleteNonAuthorWorks,
+  DOWNLOAD_RANGE_CHUNK_BYTES,
+  downloadUrlToFileInRanges,
   downloadWorks,
   ensureSafeDownloadDirectory,
   buildNonAuthorWorkList,
@@ -30,6 +32,7 @@ import {
   isRetryableRequestError,
   loadConfig,
   parseArgs,
+  parseContentRange,
   parseDeletionQueue,
   parseDownloadQueue,
   parseFileSize,
@@ -46,6 +49,7 @@ import {
   workCodeFromSearchWork,
   workIdFromArchiveName,
   validateSearchResponse,
+  writeResults,
   writeResponseBodyToFile,
 } from "../src/index.ts";
 import { mapLimit } from "../src/shared.ts";
@@ -170,6 +174,93 @@ describe("下载器调用", () => {
       expect(controller.signal.aborted).toBeTrue();
       expect((await Bun.file(path).stat()).size).toBe(0);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("解析并校验 Content-Range", () => {
+    expect(parseContentRange("bytes 10-19/100")).toEqual({ start: 10, end: 19, total: 100 });
+    expect(parseContentRange("bytes 10-19/*")).toEqual({ start: 10, end: 19 });
+    expect(parseContentRange("bytes 20-10/100")).toBeUndefined();
+    expect(parseContentRange("bytes 0-100/100")).toBeUndefined();
+    expect(parseContentRange(null)).toBeUndefined();
+  });
+
+  test("使用有界 Range 分段下载并重试单个失败分段", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-range-test-"));
+    const path = join(root, "response.bin");
+    const size = DOWNLOAD_RANGE_CHUNK_BYTES * 2 + 17;
+    const data = new Uint8Array(size);
+    for (let index = 0; index < data.length; index += 1) data[index] = index % 251;
+    const ranges: string[] = [];
+    let firstRequest = true;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        const range = request.headers.get("range") ?? "";
+        ranges.push(range);
+        if (firstRequest) {
+          firstRequest = false;
+          return new Response(null, { status: 503, headers: { "Retry-After": "0" } });
+        }
+        const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+        if (!match) return new Response(null, { status: 400 });
+        const start = Number(match[1]);
+        const end = Math.min(Number(match[2]), data.length - 1);
+        return new Response(data.slice(start, end + 1), {
+          status: 206,
+          headers: {
+            "Content-Length": String(end - start + 1),
+            "Content-Range": `bytes ${start}-${end}/${data.length}`,
+          },
+        });
+      },
+    });
+    try {
+      expect(await downloadUrlToFileInRanges(server.url.toString(), path, {
+        requestTimeoutMs: 5_000,
+        maxRetries: 1,
+        proxyUrl: "",
+      })).toBe(data.length);
+      expect(ranges).toEqual([
+        `bytes=0-${DOWNLOAD_RANGE_CHUNK_BYTES - 1}`,
+        `bytes=0-${DOWNLOAD_RANGE_CHUNK_BYTES - 1}`,
+        `bytes=${DOWNLOAD_RANGE_CHUNK_BYTES}-${DOWNLOAD_RANGE_CHUNK_BYTES * 2 - 1}`,
+        `bytes=${DOWNLOAD_RANGE_CHUNK_BYTES * 2}-${data.length - 1}`,
+      ]);
+      const actual = new Uint8Array(await Bun.file(path).arrayBuffer());
+      expect(actual.length).toBe(data.length);
+      for (const index of [0, DOWNLOAD_RANGE_CHUNK_BYTES - 1, DOWNLOAD_RANGE_CHUNK_BYTES, data.length - 1]) {
+        expect(actual[index]).toBe(data[index]);
+      }
+    } finally {
+      await server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("拒绝范围与请求不一致的分段响应", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-bad-range-test-"));
+    const path = join(root, "response.bin");
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        return new Response(new Uint8Array([1]), {
+          status: 206,
+          headers: { "Content-Length": "1", "Content-Range": "bytes 1-1/2" },
+        });
+      },
+    });
+    try {
+      await expect(downloadUrlToFileInRanges(server.url.toString(), path, {
+        requestTimeoutMs: 1_000,
+        maxRetries: 0,
+        proxyUrl: "",
+      }, 2)).rejects.toThrow("分段响应范围不符");
+    } finally {
+      await server.stop(true);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -327,9 +418,10 @@ describe("文件树和 7z 清单", () => {
 
 describe("命令行参数", () => {
   test("支持配置覆盖", () => {
-    expect(parseArgs(["--author", "甲", "--dir", "D:/voice", "--concurrency", "3"])).toMatchObject({
+    expect(parseArgs(["--author", "甲", "--dir", "D:/voice", "--asmr-dir", "D:/asmr", "--concurrency", "3"])).toMatchObject({
       author: "甲",
       archiveDir: "D:/voice",
+      asmrDir: "D:/asmr",
       concurrency: 3,
     });
   });
@@ -426,6 +518,7 @@ describe("配置与结果目录", () => {
       const configPath = join(root, "config.json");
       await Bun.write(configPath, JSON.stringify({
         archiveDir: "./archives",
+        asmrDir: "./library",
         outputDir: "./results",
         maxWorkers: 5,
         maxRetries: 6,
@@ -434,6 +527,7 @@ describe("配置与结果目录", () => {
       }));
       const config = await loadConfig({ mode: "archives", configPath, help: false });
       expect(config.archiveDir).toBe(resolve(root, "archives"));
+      expect(config.asmrDir).toBe(resolve(root, "library"));
       expect(config.outputDir).toBe(resolve(root, "results"));
       expect(config).toMatchObject({
         maxWorkers: 5,
@@ -489,6 +583,49 @@ describe("配置与结果目录", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("ASMR 资料库已有作品不写入遗漏或待下载列表", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-existing-results-test-"));
+    try {
+      const configPath = join(root, "config.json");
+      await Bun.write(configPath, JSON.stringify({
+        archiveDir: ".",
+        asmrDir: "./asmr",
+        outputDir: "./output",
+      }));
+      const config = await loadConfig({ mode: "archives", configPath, help: false });
+      await writeResults(
+        config,
+        [
+          { id: 1, source_id: "RJ1", title: "多作者作品" },
+          { id: 2, source_id: "RJ2", title: "其他作者目录已有" },
+          { id: 3, source_id: "RJ3", title: "尚未下载" },
+        ],
+        [],
+        [{ archivePath: join(root, "incoming", "RJ1.7z"), workCode: "RJ1", workId: 1, missingFiles: ["track.wav"] }],
+        [],
+        undefined,
+        [
+          { path: join(root, "asmr", "作者甲", "RJ1.7z"), workCode: "RJ1" },
+          { path: join(root, "asmr", "作者乙", "RJ1.7z"), workCode: "RJ1" },
+          { path: join(root, "asmr", "作者丙", "RJ2.7z"), workCode: "RJ2" },
+        ],
+      );
+
+      expect(await Bun.file(join(config.outputDir, "待下载的音声.txt")).text()).toBe([
+        "作品ID\t原因\t来源",
+        "RJ3\t遗漏\t尚未下载",
+        "",
+      ].join("\n"));
+      const missing = await Bun.file(join(config.outputDir, "遗漏下载的音声.txt")).text();
+      expect(missing).toContain("RJ3\t尚未下载");
+      expect(missing).not.toContain("RJ1\t");
+      expect(missing).not.toContain("RJ2\t");
+      expect(await Bun.file(join(config.outputDir, "不完整的压缩包.txt")).text()).toContain("RJ1.7z");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("本地目录扫描", () => {
@@ -515,6 +652,26 @@ describe("本地目录扫描", () => {
         ],
       });
       expect(await findDownloadedWorkFolders(join(root, "missing"))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("从 ASMR 根目录全局扫描多个作者的压缩包", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-library-global-scan-test-"));
+    try {
+      const first = join(root, "作者甲", "RJ1.7z");
+      const duplicate = join(root, "作者乙", "合辑", "RJ1.7Z");
+      const second = join(root, "作者丙", "RJ2.7z");
+      await Promise.all([
+        mkdir(join(root, "作者甲"), { recursive: true }),
+        mkdir(join(root, "作者乙", "合辑"), { recursive: true }),
+        mkdir(join(root, "作者丙"), { recursive: true }),
+      ]);
+      await Promise.all([Bun.write(first, "archive"), Bun.write(duplicate, "archive"), Bun.write(second, "archive")]);
+      expect(await findArchives(root)).toEqual(
+        [resolve(first), resolve(duplicate), resolve(second)].sort((left, right) => left.localeCompare(right)),
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -547,6 +704,7 @@ describe("下载体积限制", () => {
     const config = {
       author: "",
       archiveDir: ".",
+      asmrDir: ".",
       downloadDir: ".",
       outputDir: "./output",
       sevenZipPath: "7z",
@@ -581,6 +739,7 @@ describe("下载体积限制", () => {
     const config = {
       author: "",
       archiveDir: ".",
+      asmrDir: ".",
       downloadDir: ".",
       outputDir: "./output",
       sevenZipPath: "7z",
@@ -605,6 +764,7 @@ describe("下载体积限制", () => {
     const config = {
       author: "",
       archiveDir: ".",
+      asmrDir: ".",
       downloadDir: ".",
       outputDir: "./output",
       sevenZipPath: "7z",

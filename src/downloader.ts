@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rename, rm, stat, type FileHandle } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { API_BASE_URL } from "./constants.ts";
 import { fetchJson, fetchWorkByCode, workCodeFromSearchWork } from "./api.ts";
@@ -19,6 +19,26 @@ import type {
 
 export function isCompleteDownloadFile(actualSize: number, expectedSize?: number): boolean {
   return expectedSize === undefined || actualSize === expectedSize;
+}
+
+export const DOWNLOAD_RANGE_CHUNK_BYTES = 8 * 1024 ** 2;
+
+export type ContentRange = { start: number; end: number; total?: number };
+
+export function parseContentRange(value: string | null): ContentRange | undefined {
+  const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(value ?? "");
+  if (!match) return undefined;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = match[3] === "*" ? undefined : Number(match[3]);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    (total !== undefined && (!Number.isSafeInteger(total) || total <= end))
+  ) return undefined;
+  return { start, end, ...(total !== undefined ? { total } : {}) };
 }
 
 export async function ensureSafeDownloadDirectory(root: string, directory: string): Promise<void> {
@@ -45,13 +65,14 @@ export async function ensureSafeDownloadDirectory(root: string, directory: strin
   }
 }
 
-export async function writeResponseBodyToFile(
+async function writeResponseBodyToHandle(
   response: Response,
-  path: string,
+  file: FileHandle,
   controller: AbortController,
   inactivityTimeoutMs: number,
+  startPosition: number,
   expectedSize?: number,
-): Promise<void> {
+): Promise<number> {
   if (!response.body) throw new Error("下载响应没有文件内容");
   if (!Number.isFinite(inactivityTimeoutMs) || inactivityTimeoutMs <= 0) {
     throw new Error(`下载无数据超时必须是正数，实际为 ${inactivityTimeoutMs}`);
@@ -59,10 +80,12 @@ export async function writeResponseBodyToFile(
   if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
     throw new Error(`预期下载大小无效：${expectedSize}`);
   }
-  // Exclusive creation prevents a concurrently inserted symlink from being followed.
-  const file = await open(path, "wx", 0o600);
+  if (!Number.isSafeInteger(startPosition) || startPosition < 0) {
+    throw new Error(`下载写入位置无效：${startPosition}`);
+  }
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let position = 0;
+  let position = startPosition;
+  let received = 0;
   let completed = false;
   try {
     reader = response.body.getReader();
@@ -81,11 +104,11 @@ export async function writeResponseBodyToFile(
         completed = true;
         break;
       }
-      if (!Number.isSafeInteger(position + chunk.value.byteLength)) {
+      if (!Number.isSafeInteger(position + chunk.value.byteLength) || !Number.isSafeInteger(received + chunk.value.byteLength)) {
         controller.abort();
         throw new Error("下载文件大小超过安全整数范围");
       }
-      if (expectedSize !== undefined && position + chunk.value.byteLength > expectedSize) {
+      if (expectedSize !== undefined && received + chunk.value.byteLength > expectedSize) {
         controller.abort();
         throw new Error(`下载数据超过预期大小 ${expectedSize}`);
       }
@@ -95,6 +118,7 @@ export async function writeResponseBodyToFile(
         if (written.bytesWritten <= 0) throw new Error("无法继续写入下载文件");
         offset += written.bytesWritten;
         position += written.bytesWritten;
+        received += written.bytesWritten;
       }
     }
   } finally {
@@ -102,6 +126,158 @@ export async function writeResponseBodyToFile(
       if (!completed) await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
+  }
+  return received;
+}
+
+export async function writeResponseBodyToFile(
+  response: Response,
+  path: string,
+  controller: AbortController,
+  inactivityTimeoutMs: number,
+  expectedSize?: number,
+): Promise<void> {
+  // Exclusive creation prevents a concurrently inserted symlink from being followed.
+  const file = await open(path, "wx", 0o600);
+  try {
+    await writeResponseBodyToHandle(response, file, controller, inactivityTimeoutMs, 0, expectedSize);
+  } finally {
+    await file.close();
+  }
+}
+
+export async function downloadUrlToFileInRanges(
+  url: string,
+  path: string,
+  config: Pick<Config, "requestTimeoutMs" | "maxRetries" | "proxyUrl">,
+  expectedSize?: number,
+): Promise<number> {
+  if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
+    throw new Error(`预期下载大小无效：${expectedSize}`);
+  }
+  const file = await open(path, "wx", 0o600);
+  let position = 0;
+  let totalSize = expectedSize;
+  try {
+    while (totalSize === undefined || position < totalSize) {
+      const requestedEnd = Math.min(
+        position + DOWNLOAD_RANGE_CHUNK_BYTES - 1,
+        totalSize === undefined ? Number.MAX_SAFE_INTEGER : totalSize - 1,
+      );
+      let lastError: unknown;
+      let rangeComplete = false;
+      for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+        const controller = new AbortController();
+        let response: Response | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let connectionTimedOut = false;
+        try {
+          timer = setTimeout(() => {
+            connectionTimedOut = true;
+            controller.abort();
+          }, config.requestTimeoutMs);
+          response = await fetch(url, {
+            headers: {
+              Range: `bytes=${position}-${requestedEnd}`,
+              "User-Agent": "asmr-archive-checker/1.0",
+            },
+            signal: controller.signal,
+            ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
+          });
+          clearTimeout(timer);
+          timer = undefined;
+          if (!response.ok) throw httpErrorFromResponse(response);
+
+          const lengthHeader = response.headers.has("content-encoding")
+            ? null
+            : response.headers.get("content-length");
+          const responseSize = lengthHeader && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : undefined;
+          if (responseSize !== undefined && (!Number.isSafeInteger(responseSize) || responseSize < 0)) {
+            throw new Error(`响应文件大小无效：${lengthHeader}`);
+          }
+
+          if (response.status === 206) {
+            if (response.headers.has("content-encoding")) {
+              throw new Error("分段响应不应包含 Content-Encoding");
+            }
+            const contentRange = parseContentRange(response.headers.get("content-range"));
+            if (!contentRange || contentRange.total === undefined) {
+              throw new Error(`分段响应的 Content-Range 无效：${response.headers.get("content-range") ?? "缺失"}`);
+            }
+            if (contentRange.start !== position || contentRange.end > requestedEnd) {
+              throw new Error(
+                `分段响应范围不符：请求 ${position}-${requestedEnd}，响应 ${contentRange.start}-${contentRange.end}`,
+              );
+            }
+            if (totalSize !== undefined && contentRange.total !== totalSize) {
+              throw new Error(`响应文件大小不符：预期 ${totalSize}，响应声明 ${contentRange.total}`);
+            }
+            totalSize = contentRange.total;
+            const expectedRangeSize = contentRange.end - contentRange.start + 1;
+            if (responseSize !== undefined && responseSize !== expectedRangeSize) {
+              throw new Error(`分段响应大小不符：范围 ${expectedRangeSize}，响应声明 ${responseSize}`);
+            }
+            const received = await writeResponseBodyToHandle(
+              response,
+              file,
+              controller,
+              config.requestTimeoutMs,
+              position,
+              expectedRangeSize,
+            );
+            if (received !== expectedRangeSize) {
+              throw new Error(`分段响应提前结束：预期 ${expectedRangeSize}，实际 ${received}`);
+            }
+            position += received;
+          } else if (response.status === 200 && position === 0) {
+            if (totalSize !== undefined && responseSize !== undefined && responseSize !== totalSize) {
+              throw new Error(`响应文件大小不符：预期 ${totalSize}，响应声明 ${responseSize}`);
+            }
+            const fullSize = totalSize ?? responseSize;
+            const received = await writeResponseBodyToHandle(
+              response,
+              file,
+              controller,
+              config.requestTimeoutMs,
+              0,
+              fullSize,
+            );
+            if (fullSize !== undefined && received !== fullSize) {
+              throw new Error(`响应提前结束：预期 ${fullSize}，实际 ${received}`);
+            }
+            position = received;
+            totalSize = received;
+          } else {
+            throw new Error(`资源服务器没有按请求返回分段数据：HTTP ${response.status}`);
+          }
+          rangeComplete = true;
+          break;
+        } catch (error) {
+          const requestError = connectionTimedOut
+            ? new Error(`下载连接超过 ${config.requestTimeoutMs} 毫秒未响应`)
+            : error;
+          lastError = requestError;
+          await file.truncate(position);
+          if (attempt < config.maxRetries && isRetryableRequestError(requestError)) {
+            const delayMs = retryDelayMilliseconds(requestError, attempt + 1, 60_000);
+            logger.warn(
+              `下载分段失败（${attempt + 1}/${config.maxRetries + 1}，字节 ${position}-${requestedEnd}）：` +
+              `${errorMessage(requestError)}；${delayMs} 毫秒后重试`,
+            );
+            await Bun.sleep(delayMs);
+          } else if (!isRetryableRequestError(requestError)) {
+            break;
+          }
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+          controller.abort();
+          if (response?.body && !response.body.locked) await response.body.cancel().catch(() => undefined);
+        }
+      }
+      if (!rangeComplete) throw new Error(`下载分段 ${position}-${requestedEnd} 失败：${errorMessage(lastError)}`, { cause: lastError });
+    }
+    return position;
+  } finally {
     await file.close();
   }
 }
@@ -125,68 +301,23 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
     if (existing.isFile() && isCompleteDownloadFile(existing.size, file.size)) return "skipped";
     if (!existing.isFile()) throw new Error(`${file.relativePath}：目标路径存在但不是文件`);
   }
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let connectionTimedOut = false;
-    try {
-      await rm(partialPath, { force: true });
-      timer = setTimeout(() => {
-        connectionTimedOut = true;
-        controller.abort();
-      }, config.requestTimeoutMs);
-      const response = await fetch(file.url, {
-        headers: { "User-Agent": "asmr-archive-checker/1.0" },
-        signal: controller.signal,
-        ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
-      });
-      clearTimeout(timer);
-      timer = undefined;
-      if (!response.ok) throw httpErrorFromResponse(response);
-      const lengthHeader = response.headers.has("content-encoding") ? null : response.headers.get("content-length");
-      const responseSize = lengthHeader && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : undefined;
-      if (responseSize !== undefined && (!Number.isSafeInteger(responseSize) || responseSize < 0)) {
-        throw new Error(`响应文件大小无效：${lengthHeader}`);
-      }
-      if (file.size !== undefined && responseSize !== undefined && file.size !== responseSize) {
-        throw new Error(`响应文件大小不符：预期 ${file.size}，响应声明 ${responseSize}`);
-      }
-      const expectedSize = file.size ?? responseSize;
-      await writeResponseBodyToFile(response, partialPath, controller, config.requestTimeoutMs, expectedSize);
-      if (expectedSize !== undefined) {
-        const actualSize = (await stat(partialPath)).size;
-        if (actualSize !== expectedSize) {
-          throw new Error(`文件大小不符：预期 ${expectedSize}，实际 ${actualSize}`);
-        }
-      }
-      await rm(targetPath, { force: true });
-      await rename(partialPath, targetPath);
-      return "downloaded";
-    } catch (error) {
-      const requestError = connectionTimedOut
-        ? new Error(`下载连接超过 ${config.requestTimeoutMs} 毫秒未响应`)
-        : error;
-      lastError = requestError;
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
-      controller.abort();
-      if (attempt < config.maxRetries && isRetryableRequestError(requestError)) {
-        const delayMs = retryDelayMilliseconds(requestError, attempt + 1, 60_000);
-        logger.warn(`下载失败（${attempt + 1}/${config.maxRetries + 1}）：${file.relativePath}（${errorMessage(requestError)}）；${delayMs} 毫秒后重试`);
-        await Bun.sleep(delayMs);
-      } else if (!isRetryableRequestError(requestError)) {
-        break;
-      }
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-      controller.abort();
+  try {
+    await rm(partialPath, { force: true });
+    const downloadedSize = await downloadUrlToFileInRanges(file.url, partialPath, config, file.size);
+    if (file.size !== undefined && downloadedSize !== file.size) {
+      throw new Error(`文件大小不符：预期 ${file.size}，实际 ${downloadedSize}`);
     }
+    const actualSize = (await stat(partialPath)).size;
+    if (actualSize !== downloadedSize) {
+      throw new Error(`文件写入大小不符：下载 ${downloadedSize}，磁盘文件 ${actualSize}`);
+    }
+    await rm(targetPath, { force: true });
+    await rename(partialPath, targetPath);
+    return "downloaded";
+  } catch (error) {
+    await rm(partialPath, { force: true }).catch(() => undefined);
+    throw new Error(`${file.relativePath}：${errorMessage(error)}`, { cause: error });
   }
-  await rm(partialPath, { force: true }).catch(() => undefined);
-  throw new Error(`${file.relativePath}：${errorMessage(lastError)}`, { cause: lastError });
 };
 
 export async function prepareStagingPath(stagingRoot: string, displayId: string): Promise<string> {

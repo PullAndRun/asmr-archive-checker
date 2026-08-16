@@ -7,6 +7,7 @@ import type { CliOptions, Config, Mode } from "./types.ts";
 const DEFAULT_CONFIG: Config = {
   author: "",
   archiveDir: ".",
+  asmrDir: "./asmr",
   downloadDir: "",
   outputDir: "./output",
   sevenZipPath: "7z",
@@ -36,6 +37,7 @@ export function usage(): string {
   --config <文件>       配置文件，默认 ./config.json
   --author <作者名>     临时覆盖作者名
   --dir <7z目录>        临时覆盖压缩包目录
+  --asmr-dir <目录>     保存成品 7z 的 ASMR 资料库根目录
   --output <输出目录>   临时覆盖输出目录
   --download-dir <目录> 下载完整作品的目录；download 模式必须指定
   --7z <程序路径>       7z 可执行程序，默认 7z
@@ -57,6 +59,7 @@ export function parseArgs(args: string[]): CliOptions {
     "--config": "configPath",
     "--author": "author",
     "--dir": "archiveDir",
+    "--asmr-dir": "asmrDir",
     "--output": "outputDir",
     "--download-dir": "downloadDir",
     "--7z": "sevenZipPath",
@@ -118,6 +121,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
     ...fileConfig,
     ...(cli.author !== undefined ? { author: cli.author } : {}),
     ...(cli.archiveDir !== undefined ? { archiveDir: cli.archiveDir } : {}),
+    ...(cli.asmrDir !== undefined ? { asmrDir: cli.asmrDir } : {}),
     ...(cli.outputDir !== undefined ? { outputDir: cli.outputDir } : {}),
     ...(cli.downloadDir !== undefined ? { downloadDir: cli.downloadDir } : {}),
     ...(cli.sevenZipPath !== undefined ? { sevenZipPath: cli.sevenZipPath } : {}),
@@ -128,6 +132,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
   if (typeof merged.author !== "string") throw new Error("author 必须是字符串");
   if (cli.mode === "author" && !merged.author.trim()) throw new Error("author 模式需要填写作者名");
   if (typeof merged.archiveDir !== "string" || !merged.archiveDir.trim()) throw new Error("archiveDir 必须是非空目录路径");
+  if (typeof merged.asmrDir !== "string" || !merged.asmrDir.trim()) throw new Error("asmrDir 必须是非空目录路径");
   if (typeof merged.downloadDir !== "string") throw new Error("downloadDir 必须是目录路径或空字符串");
   if (cli.mode === "download" && !merged.downloadDir.trim()) throw new Error("download 模式需要指定 downloadDir");
   if (typeof merged.outputDir !== "string" || !merged.outputDir.trim()) throw new Error("outputDir 必须是非空目录路径");
@@ -157,6 +162,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
     ...merged,
     author: merged.author.trim(),
     archiveDir: resolvePath(configBase, merged.archiveDir),
+    asmrDir: resolvePath(configBase, merged.asmrDir),
     downloadDir: merged.downloadDir.trim() ? resolvePath(configBase, merged.downloadDir) : "",
     outputDir: resolvePath(configBase, merged.outputDir),
     proxyUrl,
@@ -172,6 +178,7 @@ export function validateOutputDirectory(config: Config): void {
   if (dirname(outputDir) === outputDir) throw new Error("outputDir 不能是磁盘根目录");
   if (outputDir === workingDirectory || containsPath(outputDir, workingDirectory)) throw new Error("outputDir 不能是项目目录或其上级目录");
   if (containsPath(outputDir, config.archiveDir)) throw new Error("outputDir 不能等于或包含 archiveDir");
+  if (containsPath(outputDir, config.asmrDir)) throw new Error("outputDir 不能等于或包含 asmrDir");
   if (config.downloadDir && containsPath(outputDir, config.downloadDir)) throw new Error("outputDir 不能等于或包含 downloadDir");
 }
 
