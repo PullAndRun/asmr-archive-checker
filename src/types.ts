@@ -62,7 +62,7 @@ export type DeletionFailure = { archivePath: string; error: string };
 export type DownloadResult = {
   workId: number;
   displayId: string;
-  status: "downloaded" | "skipped" | "failed";
+  status: "downloaded" | "skipped" | "unavailable" | "failed";
   targetPath?: string;
   stagingPath?: string;
   size?: number;

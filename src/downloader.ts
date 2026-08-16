@@ -23,6 +23,13 @@ export function isCompleteDownloadFile(actualSize: number, expectedSize?: number
 
 export const DOWNLOAD_RANGE_CHUNK_BYTES = 8 * 1024 ** 2;
 
+class TrackListUnavailableError extends Error {
+  constructor(workId: number, cause: unknown) {
+    super(`站点暂无可下载资源（作品 ${workId} 没有文件列表）`, { cause });
+    this.name = "TrackListUnavailableError";
+  }
+}
+
 export type ContentRange = { start: number; end: number; total?: number };
 
 export function parseContentRange(value: string | null): ContentRange | undefined {
@@ -349,7 +356,15 @@ const downloadWithBuiltin = async (
   stagingPath: string,
   config: Config,
 ): Promise<void> => {
-  const trackTree = await fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config);
+  let trackTree: TrackNode[];
+  try {
+    trackTree = await fetchJson<TrackNode[]>(`${API_BASE_URL}/api/tracks/${workId}?v=2`, config);
+  } catch (error) {
+    if (findHttpResponseError(error)?.status === 404) {
+      throw new TrackListUnavailableError(workId, error);
+    }
+    throw error;
+  }
   if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
   const files = buildDownloadFilePlan(trackTree);
   if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
@@ -407,6 +422,9 @@ const downloadWork = async (
     await rename(stagingPath, targetPath);
     return { workId, displayId, status: "downloaded", targetPath, size };
   } catch (error) {
+    if (error instanceof TrackListUnavailableError) {
+      return { workId, displayId, status: "unavailable", stagingPath, error: error.message };
+    }
     if (findHttpResponseError(error)?.status === 503) {
       throw new Error(`作品 ${displayId}：${errorMessage(error)}`, { cause: error });
     }
@@ -474,6 +492,7 @@ export async function downloadWorks(
         break;
       }
     } else if (result.status === "skipped") logger.info(`作品已存在，跳过：${result.displayId}`);
+    else if (result.status === "unavailable") logger.warn(`站点暂无资源，跳过：${result.displayId}：${result.error}`);
     else {
       logger.error(`作品失败：${result.displayId}：${result.error}`);
       if (outcome.serviceUnavailable) {
@@ -508,6 +527,8 @@ export async function downloadWorks(
         }
       } else if (result.status === "skipped") {
         logger.info(`作品已存在，跳过：${result.displayId}`);
+      } else if (result.status === "unavailable") {
+        logger.warn(`站点暂无资源，跳过：${result.displayId}：${result.error}`);
       } else {
         logger.error(`重试失败：${result.displayId}：${result.error}`);
         if (outcome.serviceUnavailable) {

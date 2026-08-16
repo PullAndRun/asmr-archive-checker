@@ -66,6 +66,7 @@ const runDownload = async (config: Config): Promise<void> => {
   logger.info(
     `本次结束：下载成功 ${downloads.filter((item) => item.status === "downloaded").length} 个，` +
     `已存在 ${downloads.filter((item) => item.status === "skipped").length} 个，` +
+    `站点暂无资源 ${downloads.filter((item) => item.status === "unavailable").length} 个，` +
     `失败 ${downloads.filter((item) => item.status === "failed").length} 个，` +
     `下载体积 ${formatFileSize(batch.downloadedSize)}。`,
   );

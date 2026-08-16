@@ -24,6 +24,7 @@ import {
   findArchivesInRoots,
   findDownloadedWorkFolders,
   fetchJson,
+  findHttpResponseError,
   flattenTrackTree,
   formatFileSize,
   formatWorkId,
@@ -782,6 +783,38 @@ describe("下载体积限制", () => {
     expect(batch.results).toMatchObject([{ status: "failed", error: "执行器崩溃" }]);
   });
 
+  test("站点暂无资源的作品会跳过且不重试", async () => {
+    const config = {
+      author: "",
+      archiveDir: ".",
+      asmrDir: ".",
+      downloadDir: ".",
+      outputDir: "./output",
+      sevenZipPath: "7z",
+      concurrency: 1,
+      maxWorkers: 1,
+      maxRetries: 3,
+      proxyUrl: "",
+      syncQps: 2,
+      requestTimeoutMs: 30_000,
+      maxDownloadSize: "",
+    };
+    let attempts = 0;
+    const batch = await downloadWorks([293287], config, async (workId) => {
+      attempts += 1;
+      return {
+        workId,
+        displayId: formatWorkId(workId),
+        status: "unavailable",
+        error: "站点暂无可下载资源",
+      };
+    });
+
+    expect(attempts).toBe(1);
+    expect(batch.results).toMatchObject([{ status: "unavailable", error: "站点暂无可下载资源" }]);
+    expect(batch.remainingCount).toBe(0);
+  });
+
   test("资源服务器持续返回 503 时停止后续作品", async () => {
     const config = {
       author: "",
@@ -857,7 +890,9 @@ describe("API 请求", () => {
     });
     const config = { requestTimeoutMs: 1_000, maxRetries: 3, proxyUrl: "" };
     try {
-      await expect(fetchJson(`${server.url}not-found`, config)).rejects.toThrow("HTTP 404");
+      const notFound = fetchJson(`${server.url}not-found`, config);
+      await expect(notFound).rejects.toThrow("HTTP 404");
+      await notFound.catch((error) => expect(findHttpResponseError(error)?.status).toBe(404));
       expect(notFoundRequests).toBe(1);
       expect(await fetchJson<{ ok: boolean }>(`${server.url}retry`, config)).toEqual({ ok: true });
       expect(retryRequests).toBe(2);

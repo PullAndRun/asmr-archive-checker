@@ -89,7 +89,7 @@ export async function fetchJson<T>(
       clearTimeout(timer);
     }
   }
-  throw new Error(`请求失败 ${url}：${errorMessage(lastError)}`);
+  throw new Error(`请求失败 ${url}：${errorMessage(lastError)}`, { cause: lastError });
 }
 
 export function validateSearchResponse(value: unknown): asserts value is SearchResponse {
