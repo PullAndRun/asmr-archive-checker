@@ -1,6 +1,6 @@
 import { basename, join, resolve } from "node:path";
 import { createRequestThrottle, fetchAllWorks, workCodeFromSearchWork } from "./api.ts";
-import { checkArchive, classifyArchives, findArchives, findDownloadedWorkFolders, scanLocalCollection } from "./archive-service.ts";
+import { checkArchive, classifyArchives, findArchivesInRoots, findDownloadedWorkFolders } from "./archive-service.ts";
 import { ensureDirectory, loadConfig, parseArgs, requireDirectory, usage, validateOutputDirectory } from "./config.ts";
 import {
   DELETE_QUEUE_FILE_NAME,
@@ -90,20 +90,28 @@ const runCheck = async (
   logger.info(`7z 目录：${config.archiveDir}`);
   logger.info(`ASMR 资料库：${config.asmrDir}`);
 
+  const apiThrottle = createRequestThrottle(config.syncQps);
+  logger.info(`API 请求速率：每秒最多 ${config.syncQps} 次`);
   const extraFolderRoots = mode === "author"
     ? [...new Set([config.downloadDir].filter((root) => root && root !== config.archiveDir))]
     : [];
-  const [localCollection, extraFolderGroups, savedArchivePaths] = await Promise.all([
-    mode === "author"
-      ? scanLocalCollection(config.archiveDir)
-      : findArchives(config.archiveDir).then((archives) => ({ archives, folders: [] })),
-    Promise.all(extraFolderRoots.map(findDownloadedWorkFolders)),
-    findArchives(config.asmrDir),
+  const scanStartedAt = performance.now();
+  const localScan = Promise.all([
+    findArchivesInRoots([config.archiveDir, config.asmrDir]),
+    mode === "author" ? Promise.all([config.archiveDir, ...extraFolderRoots].map(findDownloadedWorkFolders)) : [],
+  ]).then(([archiveGroups, folderGroups]) => ({
+    archiveGroups,
+    folderGroups,
+    elapsedMs: performance.now() - scanStartedAt,
+  }));
+  const [{ archiveGroups: [archivePaths, savedArchivePaths], folderGroups, elapsedMs }, works] = await Promise.all([
+    localScan,
+    mode === "author" ? fetchAllWorks(config, apiThrottle) : Promise.resolve([]),
   ]);
-  const archivePaths = localCollection.archives;
   const downloadedFolders = [...new Map(
-    [localCollection.folders, ...extraFolderGroups].flat().map((folder) => [folder.path, folder]),
+    folderGroups.flat().map((folder) => [folder.path, folder]),
   ).values()];
+  logger.info(`本地文件查询完成：${elapsedMs.toFixed(0)} 毫秒`);
   const { recognized: recognizedArchives, unknown: unknownArchives } = classifyArchives(archivePaths);
   const checkedPathKeys = new Set(archivePaths.map((path) => {
     const key = resolve(path);
@@ -114,9 +122,6 @@ const runCheck = async (
     const key = resolve(archive.path);
     return !checkedPathKeys.has(process.platform === "win32" ? key.toLowerCase() : key);
   });
-  const apiThrottle = createRequestThrottle(config.syncQps);
-  logger.info(`API 请求速率：每秒最多 ${config.syncQps} 次`);
-  const works = mode === "author" ? await fetchAllWorks(config, apiThrottle) : [];
   const websiteWorks = new Map(works.map((work) => [workCodeFromSearchWork(work), work]));
   const websiteCodes = new Set(websiteWorks.keys());
   const archivesToCheck: CodedLocalWork[] = mode === "author"

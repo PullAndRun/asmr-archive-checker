@@ -21,6 +21,7 @@ import {
   findMissingFiles,
   findNonAuthorWorks,
   findArchives,
+  findArchivesInRoots,
   findDownloadedWorkFolders,
   fetchJson,
   flattenTrackTree,
@@ -672,6 +673,27 @@ describe("本地目录扫描", () => {
       expect(await findArchives(root)).toEqual(
         [resolve(first), resolve(duplicate), resolve(second)].sort((left, right) => left.localeCompare(right)),
       );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("资料库包含作者目录时只需一次根扫描并正确分组", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-overlapping-roots-test-"));
+    try {
+      const authorRoot = join(root, "作者甲");
+      const first = join(authorRoot, "RJ1.7z");
+      const second = join(root, "作者乙", "RJ2.7z");
+      await Promise.all([
+        mkdir(authorRoot, { recursive: true }),
+        mkdir(join(root, "作者乙"), { recursive: true }),
+      ]);
+      await Promise.all([Bun.write(first, "archive"), Bun.write(second, "archive")]);
+
+      const [allAuthors, oneAuthor, duplicateRoot] = await findArchivesInRoots([root, authorRoot, root]);
+      expect(allAuthors).toEqual([resolve(first), resolve(second)].sort((left, right) => left.localeCompare(right)));
+      expect(oneAuthor).toEqual([resolve(first)]);
+      expect(duplicateRoot).toEqual(allAuthors);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

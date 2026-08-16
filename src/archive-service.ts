@@ -1,10 +1,10 @@
 import { readdir } from "node:fs/promises";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, extname, join, resolve, sep } from "node:path";
 import { API_BASE_URL } from "./constants.ts";
 import { fetchJson, fetchWorkByCode } from "./api.ts";
 import { findMissingFiles, flattenTrackTree, parseSevenZipListing, type ArchiveEntry, type TrackNode } from "./domain/archive.ts";
 import { workCodeFromArchiveName, type WorkCode } from "./domain/work-code.ts";
-import { errorMessage } from "./shared.ts";
+import { containsPath, errorMessage } from "./shared.ts";
 import type { CodedLocalWork, IncompleteArchive, LocalWork } from "./domain/records.ts";
 import type { Config, RequestThrottle } from "./types.ts";
 
@@ -64,6 +64,34 @@ export async function scanLocalCollection(root: string): Promise<LocalTreeScan> 
 
 export async function findArchives(root: string): Promise<string[]> {
   return (await scanLocalTree(root, true, false, false)).archives;
+}
+
+/**
+ * Scan overlapping roots only once, then partition the results back to the
+ * requested roots. This is important when archiveDir is an author folder
+ * inside a much larger asmrDir.
+ */
+export async function findArchivesInRoots(roots: readonly string[]): Promise<string[][]> {
+  if (roots.length === 0) return [];
+  const resolvedRoots = roots.map((root) => resolve(root));
+  const uniqueRoots = [...new Map(resolvedRoots.map((root) => {
+    const key = process.platform === "win32" ? root.toLowerCase() : root;
+    return [key, root] as const;
+  })).values()];
+  const scanRoots = uniqueRoots.filter((candidate) =>
+    !uniqueRoots.some((other) => other !== candidate && containsPath(other, candidate))
+  );
+  const allArchives = (await Promise.all(scanRoots.map(findArchives))).flat();
+  return resolvedRoots.map((root) => {
+    const rootKey = process.platform === "win32" ? root.toLowerCase() : root;
+    const prefix = rootKey.endsWith(sep) ? rootKey : `${rootKey}${sep}`;
+    return allArchives
+      .filter((path) => {
+        const pathKey = process.platform === "win32" ? path.toLowerCase() : path;
+        return pathKey === rootKey || pathKey.startsWith(prefix);
+      })
+      .toSorted((left, right) => left.localeCompare(right))
+  });
 }
 
 export async function findDownloadedWorkFolders(root: string): Promise<LocalWork[]> {
