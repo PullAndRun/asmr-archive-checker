@@ -12,6 +12,7 @@ export type Config = {
   maxWorkers: number;
   maxRetries: number;
   proxyUrl: string;
+  apiUrls?: string[];
   syncQps: number;
   requestTimeoutMs: number;
   archiveTimeoutMs?: number;
@@ -19,7 +20,7 @@ export type Config = {
   maxDownloadSizeBytes?: number;
 };
 
-export type Mode = "author" | "archives" | "delete" | "delete-non-author" | "download";
+export type Mode = "author" | "archives" | "delete" | "delete-non-author" | "download" | "find";
 
 export type CliOptions = {
   mode: Mode;
@@ -67,9 +68,11 @@ export type DownloadResult = {
   stagingPath?: string;
   size?: number;
   error?: string;
+  retryAfterMinutes?: number;
+  retryAfterAt?: string;
 };
 
-export type DownloadTarget = { workId: number; displayId: string };
+export type DownloadTarget = { workId: number; displayId: string; author?: string };
 
 export type DownloadBatchResult = {
   results: DownloadResult[];

@@ -2,7 +2,7 @@ import { lstat, mkdir, open, readdir, rename, rm, stat, type FileHandle } from "
 import { dirname, join, relative, resolve } from "node:path";
 import { API_BASE_URL } from "./constants.ts";
 import { fetchJson, fetchWorkByCode, workCodeFromSearchWork } from "./api.ts";
-import { buildDownloadFilePlan, type DownloadFile, type TrackNode } from "./domain/archive.ts";
+import { buildDownloadFilePlan, sanitizeDownloadPathSegment, type DownloadFile, type TrackNode } from "./domain/archive.ts";
 import { formatFileSize, hasReachedDownloadSizeLimit } from "./domain/size.ts";
 import { formatWorkId } from "./domain/work-code.ts";
 import { directorySize, pathExists } from "./fs-utils.ts";
@@ -22,6 +22,24 @@ export function isCompleteDownloadFile(actualSize: number, expectedSize?: number
 }
 
 export const DOWNLOAD_RANGE_CHUNK_BYTES = 8 * 1024 ** 2;
+const KIKO_MEDIA_REQUEST_INTERVAL_MS = 1_500;
+let nextKikoMediaRequestAt = 0;
+
+function isKikoMediaUrl(url: string): boolean {
+  try {
+    return new URL(url).hostname.toLowerCase().endsWith(".kiko-play-niptan.one");
+  } catch {
+    return false;
+  }
+}
+
+async function waitForKikoMediaRequest(url: string): Promise<void> {
+  if (!isKikoMediaUrl(url)) return;
+  const now = performance.now();
+  const delay = Math.max(0, nextKikoMediaRequestAt - now);
+  nextKikoMediaRequestAt = Math.max(now, nextKikoMediaRequestAt) + KIKO_MEDIA_REQUEST_INTERVAL_MS;
+  if (delay > 0) await Bun.sleep(delay);
+}
 
 class TrackListUnavailableError extends Error {
   constructor(workId: number, cause: unknown) {
@@ -179,6 +197,7 @@ export async function downloadUrlToFileInRanges(
         let timer: ReturnType<typeof setTimeout> | undefined;
         let connectionTimedOut = false;
         try {
+          await waitForKikoMediaRequest(url);
           timer = setTimeout(() => {
             connectionTimedOut = true;
             controller.abort();
@@ -186,7 +205,14 @@ export async function downloadUrlToFileInRanges(
           response = await fetch(url, {
             headers: {
               Range: `bytes=${position}-${requestedEnd}`,
-              "User-Agent": "asmr-archive-checker/1.0",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              Accept: "*/*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              Referer: "https://www.asmr.one/",
+              Origin: "https://www.asmr.one",
+              "Sec-Fetch-Dest": "empty",
+              "Sec-Fetch-Mode": "cors",
+              "Sec-Fetch-Site": "cross-site",
             },
             signal: controller.signal,
             ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
@@ -368,10 +394,12 @@ const downloadWithBuiltin = async (
   if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
   const files = buildDownloadFilePlan(trackTree);
   if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
-  logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${config.maxWorkers}`);
+  const kikoMedia = files.some((file) => isKikoMediaUrl(file.url));
+  const workerCount = kikoMedia ? 1 : config.maxWorkers;
+  logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${workerCount}${kikoMedia ? "（媒体服务器节流）" : ""}`);
   let processed = 0;
   let reused = 0;
-  const errors = await mapLimit(files, config.maxWorkers, async (file) => {
+  const errors = await mapLimit(files, workerCount, async (file) => {
     try {
       const status = await downloadFile(file, stagingPath, config);
       if (status === "skipped") reused += 1;
@@ -383,10 +411,14 @@ const downloadWithBuiltin = async (
       const message = errorMessage(error);
       processed += 1;
       logger.warn(`[${processed}/${files.length}] 失败 ${file.relativePath}：${message}`);
-      return message;
+      return { message, cause: error };
     }
   });
-  const failures = errors.filter((error): error is string => typeof error === "string");
+  const failures = errors.filter((error): error is { message: string; cause: unknown } =>
+    typeof error === "object" && error !== null && "message" in error && "cause" in error);
+  if (failures.length > 0) {
+    throw new Error(`${failures.length} files failed; first error: ${failures[0].message}`, { cause: failures[0].cause });
+  }
   if (failures.length > 0) throw new Error(`${failures.length} 个文件下载失败；首个错误：${failures[0]}`);
   if (reused > 0) logger.info(`复用了 ${reused} 个已下载文件`);
 };
@@ -396,7 +428,11 @@ const downloadWork = async (
   config: Config,
 ): Promise<DownloadResult> => {
   const { workId, displayId } = target;
-  const targetPath = join(config.downloadDir, displayId);
+  const targetPath = join(
+    config.downloadDir,
+    ...(target.author ? [sanitizeDownloadPathSegment(target.author)] : []),
+    displayId,
+  );
   if (await pathExists(targetPath)) {
     const info = await lstat(targetPath);
     if (info.isSymbolicLink()) {
@@ -407,28 +443,47 @@ const downloadWork = async (
       : { workId, displayId, status: "failed", error: `目标路径存在但不是文件夹：${targetPath}` };
   }
   const stagingRoot = join(config.downloadDir, ".asmr-archive-checker-downloads");
-  let stagingPath = join(stagingRoot, displayId);
+  const authorSegment = target.author ? sanitizeDownloadPathSegment(target.author) : undefined;
+  const stagingAuthorRoot = authorSegment ? join(stagingRoot, authorSegment) : stagingRoot;
+  let stagingPath = join(stagingAuthorRoot, displayId);
   try {
     await mkdir(stagingRoot, { recursive: true });
     const stagingRootInfo = await lstat(stagingRoot);
     if (stagingRootInfo.isSymbolicLink() || !stagingRootInfo.isDirectory()) {
       throw new Error(`下载临时根路径不是普通文件夹：${stagingRoot}`);
     }
-    stagingPath = await prepareStagingPath(stagingRoot, displayId);
+    await mkdir(stagingAuthorRoot, { recursive: true });
+    stagingPath = await prepareStagingPath(stagingAuthorRoot, displayId);
     logger.info(`下载完整作品 ${displayId} ...`);
     await downloadWithBuiltin(workId, stagingPath, config);
     if (await pathExists(targetPath)) throw new Error(`目标文件夹已存在：${targetPath}`);
     const size = await directorySize(stagingPath);
+    await ensureSafeDownloadDirectory(config.downloadDir, dirname(targetPath));
     await rename(stagingPath, targetPath);
     return { workId, displayId, status: "downloaded", targetPath, size };
   } catch (error) {
+    const responseError = findHttpResponseError(error);
+    const retryAfterMinutes = responseError?.retryAfterTotalMs === undefined
+      ? undefined
+      : Math.round(responseError.retryAfterTotalMs / 60_000 * 100) / 100;
+    if (retryAfterMinutes !== undefined) {
+      logger.warn(`作品 ${displayId} 受到限流，约 ${retryAfterMinutes} 分钟后重试${responseError?.retryAfterAt ? `（${responseError.retryAfterAt}）` : ""}`);
+    }
     if (error instanceof TrackListUnavailableError) {
       return { workId, displayId, status: "unavailable", stagingPath, error: error.message };
     }
     if (findHttpResponseError(error)?.status === 503) {
       throw new Error(`作品 ${displayId}：${errorMessage(error)}`, { cause: error });
     }
-    return { workId, displayId, status: "failed", stagingPath, error: errorMessage(error) };
+    return {
+      workId,
+      displayId,
+      status: "failed",
+      stagingPath,
+      error: errorMessage(error),
+      ...(retryAfterMinutes !== undefined ? { retryAfterMinutes } : {}),
+      ...(responseError?.retryAfterAt ? { retryAfterAt: responseError.retryAfterAt } : {}),
+    };
   }
 };
 
@@ -437,14 +492,16 @@ type TargetDownloadOne = (target: DownloadTarget, config: Config) => Promise<Dow
 
 export function downloadWorks(workIds: number[], config: Config, downloadOne?: NumericDownloadOne): Promise<DownloadBatchResult>;
 export function downloadWorks(targets: DownloadTarget[], config: Config, downloadOne?: TargetDownloadOne): Promise<DownloadBatchResult>;
+export function downloadWorks(targets: DownloadTarget[], config: Config, downloadOne: TargetDownloadOne | undefined, options?: { retryFailedWorks?: boolean }): Promise<DownloadBatchResult>;
 export async function downloadWorks(
   inputs: Array<number | DownloadTarget>,
   config: Config,
   downloadOne?: NumericDownloadOne | TargetDownloadOne,
+  options: { retryFailedWorks?: boolean } = {},
 ): Promise<DownloadBatchResult> {
   const entries = [...new Map(inputs.map((input) => {
     const target = typeof input === "number" ? { workId: input, displayId: formatWorkId(input) } : input;
-    return [`${target.workId}\0${target.displayId}`, { input, target }] as const;
+    return [`${target.author ?? ""}\0${target.workId}\0${target.displayId}`, { input, target }] as const;
   })).values()];
   const run = (entry: typeof entries[number]): Promise<DownloadResult> => {
     if (!downloadOne) return downloadWork(entry.target, config);
@@ -459,11 +516,17 @@ export async function downloadWorks(
     try {
       return { result: await run(entry), serviceUnavailable: false };
     } catch (error) {
+      const responseError = findHttpResponseError(error);
+      const retryAfterMinutes = responseError?.retryAfterTotalMs === undefined
+        ? undefined
+        : Math.round(responseError.retryAfterTotalMs / 60_000 * 100) / 100;
       return {
         result: {
           ...entry.target,
           status: "failed",
           error: errorMessage(error),
+          ...(retryAfterMinutes !== undefined ? { retryAfterMinutes } : {}),
+          ...(responseError?.retryAfterAt ? { retryAfterAt: responseError.retryAfterAt } : {}),
         },
         serviceUnavailable: findHttpResponseError(error)?.status === 503,
       };
@@ -495,6 +558,9 @@ export async function downloadWorks(
     else if (result.status === "unavailable") logger.warn(`站点暂无资源，跳过：${result.displayId}：${result.error}`);
     else {
       logger.error(`作品失败：${result.displayId}：${result.error}`);
+      if (result.retryAfterMinutes !== undefined) {
+        logger.warn(`作品 ${result.displayId} 约 ${result.retryAfterMinutes} 分钟后可重试${result.retryAfterAt ? `（${result.retryAfterAt}）` : ""}`);
+      }
       if (outcome.serviceUnavailable) {
         stoppedByServiceUnavailable = true;
         logger.warn("资源服务器持续返回 HTTP 503，已停止本轮下载；临时文件已保留，稍后重新运行可继续下载。");
@@ -503,7 +569,7 @@ export async function downloadWorks(
     }
   }
   const failedIndexes = results.flatMap((result, index) => result.status === "failed" ? [index] : []);
-  if (!stoppedByLimit && !stoppedByServiceUnavailable && failedIndexes.length > 0) {
+  if (options.retryFailedWorks !== false && !stoppedByLimit && !stoppedByServiceUnavailable && failedIndexes.length > 0) {
     logger.warn(`首轮有 ${failedIndexes.length} 部作品失败，开始续传重试。`);
     for (const [retryIndex, resultIndex] of failedIndexes.entries()) {
       const entry = entries[resultIndex];

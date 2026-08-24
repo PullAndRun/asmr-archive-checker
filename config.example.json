@@ -10,6 +10,10 @@
   "maxWorkers": 4,
   "maxRetries": 3,
   "proxyUrl": "",
+  "apiUrls": [
+    "https://api.asmr-200.com",
+    "https://api.asmr-100.com"
+  ],
   "syncQps": 2,
   "requestTimeoutMs": 30000,
   "archiveTimeoutMs": 300000

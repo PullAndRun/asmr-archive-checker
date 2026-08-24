@@ -44,9 +44,26 @@ export function buildWorkSearchUrl(id: number | string): string {
   return url.toString();
 }
 
+function resolveApiRequestUrls(url: string, apiUrls?: readonly string[]): string[] {
+  if (!apiUrls || apiUrls.length === 0) return [url];
+  let original: URL;
+  try {
+    original = new URL(url);
+  } catch {
+    return [url];
+  }
+  if (original.origin !== new URL(API_BASE_URL).origin) return [url];
+  return apiUrls.map((base) => {
+    const endpoint = new URL(base);
+    endpoint.pathname = original.pathname;
+    endpoint.search = original.search;
+    return endpoint.toString();
+  });
+}
+
 export async function fetchJson<T>(
   url: string,
-  config: Pick<Config, "requestTimeoutMs" | "maxRetries" | "proxyUrl">,
+  config: Pick<Config, "requestTimeoutMs" | "maxRetries" | "proxyUrl"> & { apiUrls?: readonly string[] },
   throttle?: RequestThrottle,
 ): Promise<T> {
   if (!Number.isFinite(config.requestTimeoutMs) || config.requestTimeoutMs <= 0) {
@@ -57,7 +74,11 @@ export async function fetchJson<T>(
   }
   const attempts = config.maxRetries + 1;
   let lastError: unknown;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  const requestUrls = resolveApiRequestUrls(url, config.apiUrls);
+  let lastRequestUrl = url;
+  for (const [endpointIndex, requestUrl] of requestUrls.entries()) {
+    lastRequestUrl = requestUrl;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
     if (throttle) await throttle();
     const controller = new AbortController();
     let timedOut = false;
@@ -66,7 +87,7 @@ export async function fetchJson<T>(
       controller.abort();
     }, config.requestTimeoutMs);
     try {
-      const response = await fetch(url, {
+      const response = await fetch(requestUrl, {
         headers: { Accept: "application/json", "User-Agent": "asmr-archive-checker/1.0" },
         signal: controller.signal,
         ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
@@ -78,6 +99,10 @@ export async function fetchJson<T>(
       lastError = requestError;
       clearTimeout(timer);
       controller.abort();
+      // With endpoint failover configured, rate limits and server-side failures
+      // should move to the next API immediately instead of exhausting retries
+      // against the same endpoint.
+      if (requestUrls.length > 1 && isRetryableRequestError(requestError)) break;
       if (attempt < attempts && isRetryableRequestError(requestError)) {
         const delayMs = retryDelayMilliseconds(requestError, attempt);
         logger.warn(`API 请求失败（${attempt}/${attempts}）：${errorMessage(requestError)}；${delayMs} 毫秒后重试`);
@@ -87,6 +112,13 @@ export async function fetchJson<T>(
       }
     } finally {
       clearTimeout(timer);
+    }
+    }
+    const nextRequestUrl = requestUrls[endpointIndex + 1];
+    if (nextRequestUrl) {
+      logger.warn(`API endpoint failed: ${requestUrl}; switching to ${nextRequestUrl}`);
+    } else {
+      logger.warn(`API endpoint failed: ${requestUrl}; no endpoint remains`);
     }
   }
   throw new Error(`请求失败 ${url}：${errorMessage(lastError)}`, { cause: lastError });
@@ -121,6 +153,21 @@ export function validateSearchResponse(value: unknown): asserts value is SearchR
   }
 }
 
+export async function fetchWorksForAuthor(
+  author: string,
+  config: Config,
+  throttle?: RequestThrottle,
+): Promise<SearchWork[]> {
+  logger.info(`Reading author works: ${author}`);
+  const searches = buildAuthorSearchKeywords(author);
+  const works: SearchWork[] = [];
+  for (const keyword of searches) {
+    works.push(...await fetchWorksByKeyword(keyword, config, throttle, author));
+  }
+  return [...new Map(works.map((work) => [work.id, work])).values()]
+    .toSorted((left, right) => right.id - left.id);
+}
+
 export async function fetchAllWorks(
   config: Config,
   throttle?: RequestThrottle,
@@ -139,7 +186,9 @@ async function fetchWorksByKeyword(
   keyword: string,
   config: Config,
   throttle?: RequestThrottle,
+  authorLabel = keyword,
 ): Promise<SearchWork[]> {
+  logger.info(`Fetching author page 1: ${authorLabel}`);
   const first = await fetchJson<SearchResponse>(buildSearchUrl(keyword, 1), config, throttle);
   validateSearchResponse(first);
   if (first.pagination.currentPage !== 1) {

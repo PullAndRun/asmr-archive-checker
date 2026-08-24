@@ -1,6 +1,7 @@
 import { mkdir, stat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { parseFileSize } from "./domain/size.ts";
+import { API_BASE_URL } from "./constants.ts";
 import { containsPath, errorMessage } from "./shared.ts";
 import type { CliOptions, Config, Mode } from "./types.ts";
 
@@ -15,6 +16,7 @@ const DEFAULT_CONFIG: Config = {
   maxWorkers: 4,
   maxRetries: 3,
   proxyUrl: "",
+  apiUrls: [API_BASE_URL],
   syncQps: 2,
   requestTimeoutMs: 30_000,
   archiveTimeoutMs: 300_000,
@@ -32,6 +34,8 @@ export function usage(): string {
   delete                读取已有检查结果，确认后删除不完整作品
   delete-non-author     读取作者检查结果，确认后删除非该作者作品
   download              读取待下载汇总并下载完整作品
+  download-authors      读取 author-download-queue.json 并按作者目录下载
+  find                  扫描 asmrDir 下的全部作者并生成作者下载队列
 
 选项：
   --config <文件>       配置文件，默认 ./config.json
@@ -51,7 +55,7 @@ export function parseArgs(args: string[]): CliOptions {
   const values = [...args];
   if (values[0] === "--") values.shift();
   let mode: Mode = "author";
-  if (["author", "archives", "delete", "delete-non-author", "download"].includes(values[0])) {
+  if (["author", "archives", "delete", "delete-non-author", "download", "find"].includes(values[0])) {
     mode = values.shift() as Mode;
   }
   const result: CliOptions = { mode, help: false };
@@ -158,6 +162,23 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
   if (!Number.isFinite(merged.archiveTimeoutMs) || merged.archiveTimeoutMs! < 1_000) throw new Error("archiveTimeoutMs 必须不少于 1000 毫秒");
   if (typeof merged.maxDownloadSize !== "string") throw new Error("maxDownloadSize 必须是带单位的体积字符串或空字符串");
 
+  if (!Array.isArray(merged.apiUrls) || merged.apiUrls.length === 0 || merged.apiUrls.some((value) => typeof value !== "string")) {
+    throw new Error("apiUrls must be a non-empty array of HTTP or HTTPS URLs");
+  }
+  const apiUrls = [...new Set(merged.apiUrls.map((value) => value.trim()).filter(Boolean))].map((value) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new Error(`apiUrls contains an invalid URL: ${value}`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`apiUrls only supports HTTP or HTTPS URLs: ${value}`);
+    }
+    return parsed.origin;
+  });
+  if (apiUrls.length === 0) throw new Error("apiUrls must contain at least one valid URL");
+
   return {
     ...merged,
     author: merged.author.trim(),
@@ -166,6 +187,7 @@ export async function loadConfig(cli: CliOptions): Promise<Config> {
     downloadDir: merged.downloadDir.trim() ? resolvePath(configBase, merged.downloadDir) : "",
     outputDir: resolvePath(configBase, merged.outputDir),
     proxyUrl,
+    apiUrls,
     maxDownloadSize: merged.maxDownloadSize.trim(),
     maxDownloadSizeBytes: merged.maxDownloadSize.trim() ? parseFileSize(merged.maxDownloadSize) : undefined,
     sevenZipPath: looksLikePath(merged.sevenZipPath) ? resolvePath(configBase, merged.sevenZipPath) : merged.sevenZipPath,

@@ -23,6 +23,7 @@ import {
 import { mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type { Config } from "./types.ts";
+import { runAuthorFind } from "./author-sync.ts";
 
 const runDelete = async (config: Config): Promise<void> => {
   await requireDirectory(config.archiveDir, "archiveDir");
@@ -183,5 +184,10 @@ export async function main(args = Bun.argv.slice(2)): Promise<void> {
   if (cli.mode === "delete") return runDelete(config);
   if (cli.mode === "delete-non-author") return runDeleteNonAuthor(config);
   if (cli.mode === "download") return runDownload(config);
+  if (cli.mode === "find") {
+    const report = await runAuthorFind(config);
+    if (report.errors.length > 0 || report.skippedAuthors.length > 0) process.exitCode = 2;
+    return;
+  }
   return runCheck(cli.mode, config);
 }

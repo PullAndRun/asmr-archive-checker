@@ -9,7 +9,10 @@
     "archives": "bun run src/index.ts archives",
     "delete": "bun run src/index.ts delete",
     "delete-non-author": "bun run src/index.ts delete-non-author",
-    "download": "bun run src/index.ts download",
+    "download": "bun run src/download.ts",
+    "download-legacy": "bun run src/index.ts download",
+    "find": "bun run src/find.ts",
+    "download-authors": "bun run src/download.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

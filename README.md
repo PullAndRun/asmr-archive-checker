@@ -48,6 +48,7 @@ Copy-Item config.example.json config.json
   "maxWorkers": 4,
   "maxRetries": 3,
   "proxyUrl": "",
+  "apiUrls": ["https://api.asmr-200.com", "https://api.asmr-100.com"],
   "syncQps": 2,
   "requestTimeoutMs": 30000,
   "archiveTimeoutMs": 300000
@@ -211,3 +212,19 @@ API/7-Zip 检查错误或下载失败时，进程退出码为 2。
 ```powershell
 bun test
 ```
+## Multi-author find/download scripts
+
+When `asmrDir` contains one directory per author, run:
+
+```powershell
+bun run find
+bun run download-authors
+```
+
+`find` queries every author directory, checks its 7z files, resolves duplicate works to the author with the larger catalogue, and writes `output/author-download-queue.json`. An incomplete 7z always queues the whole work, even when another copy exists. `download-authors` reads that queue and writes complete works to `downloadDir/<author>/<work-code>`. A failed file is removed from the temporary download and is retried on the next run; a work is moved into its final directory only after every file completes.
+
+Authors whose API list cannot be fetched are written to `output/author-skipped.json`. Download failures, including a work with any failed file, are written to `output/author-download-failures.json`.
+
+If a download reports HTTP 429 with a long `Retry-After`, the limit is from the media file server, not the API endpoint. API failover cannot change that media URL; rerun after the indicated delay.
+
+For `kiko-play-niptan.one` media, the downloader serializes files and spaces Range requests to reduce server-side rate limiting. Retry information is recorded in minutes in `output/author-download-failures.json`.

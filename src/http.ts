@@ -1,13 +1,29 @@
 export class HttpResponseError extends Error {
   readonly status: number;
   readonly retryAfterMs?: number;
+  /** Unclamped value used for user-facing retry reporting. */
+  readonly retryAfterTotalMs?: number;
+  readonly retryAfterAt?: string;
 
   constructor(response: Response) {
     super(`HTTP ${response.status} ${response.statusText}`);
     this.name = "HttpResponseError";
     this.status = response.status;
-    this.retryAfterMs = retryAfterMilliseconds(response.headers.get("retry-after"));
+    const retryAfter = response.headers.get("retry-after");
+    this.retryAfterMs = retryAfterMilliseconds(retryAfter);
+    this.retryAfterTotalMs = retryAfterMillisecondsUnbounded(retryAfter);
+    if (this.retryAfterTotalMs !== undefined) {
+      this.retryAfterAt = new Date(Date.now() + this.retryAfterTotalMs).toISOString();
+    }
   }
+}
+
+export function retryAfterMillisecondsUnbounded(value: string | null, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0 && Number.isFinite(seconds * 1_000)) return seconds * 1_000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
 }
 
 export function retryAfterMilliseconds(value: string | null, now = Date.now()): number | undefined {
