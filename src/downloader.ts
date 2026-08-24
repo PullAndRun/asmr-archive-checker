@@ -287,7 +287,7 @@ export async function downloadUrlToFileInRanges(
           break;
         } catch (error) {
           const requestError = connectionTimedOut
-            ? new Error(`下载连接超过 ${config.requestTimeoutMs} 毫秒未响应`)
+            ? new Error(`下载连接超过 ${config.requestTimeoutMs} 毫秒未响应：${url}`)
             : error;
           lastError = requestError;
           await file.truncate(position);

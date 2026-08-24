@@ -284,6 +284,35 @@ describe("下载器调用", () => {
   });
 });
 
+describe("download timeout URL", () => {
+  test("includes the URL when a download connection times out", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-download-timeout-test-"));
+    const path = join(root, "response.bin");
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch() {
+        await Bun.sleep(50);
+        return new Response(new Uint8Array([1]), {
+          status: 206,
+          headers: { "Content-Length": "1", "Content-Range": "bytes 0-0/1" },
+        });
+      },
+    });
+    try {
+      const url = server.url.toString();
+      await expect(downloadUrlToFileInRanges(url, path, {
+        requestTimeoutMs: 10,
+        maxRetries: 0,
+        proxyUrl: "",
+      }, 1)).rejects.toThrow(url);
+    } finally {
+      await server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("编号识别", () => {
   test("读取旧文件名中的多余零并规范化为真实 RJ 编号", () => {
     expect(workIdFromArchiveName("RJ328352.7z")).toBe(328352);
