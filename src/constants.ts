@@ -6,6 +6,7 @@ export const DOWNLOAD_QUEUE_FILE_NAME = "待下载的音声.txt";
 export const DELETE_QUEUE_FILE_NAME = "待删除的不完整压缩包.txt";
 export const NON_AUTHOR_FILE_NAME = "非该作者的作品.txt";
 export const AUTHOR_DOWNLOAD_QUEUE_FILE_NAME = "author-download-queue.json";
+export const AUTHOR_DOWNLOAD_LIST_FILE_NAME = "作者待下载的音声.txt";
 export const AUTHOR_FIND_REPORT_FILE_NAME = "author-find-report.json";
 export const AUTHOR_SKIPPED_FILE_NAME = "author-skipped.json";
 export const AUTHOR_DOWNLOAD_FAILURES_FILE_NAME = "author-download-failures.json";

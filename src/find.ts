@@ -9,7 +9,12 @@ if (import.meta.main) {
       console.log(usage());
     } else {
       const report = await runAuthorFind(await loadConfig(cli));
-      console.log(`find complete: ${report.queue.length} works queued`);
+      const incompleteCount = report.queue.filter((item) => item.reason === "incomplete").length;
+      const missingCount = report.queue.length - incompleteCount;
+      console.log(
+        `find complete: ${report.queue.length} works queued ` +
+        `(${incompleteCount} incomplete 7z, ${missingCount} missing works)`,
+      );
       if (report.errors.length > 0 || report.skippedAuthors.length > 0) process.exitCode = 2;
     }
   } catch (error) {

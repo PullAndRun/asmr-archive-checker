@@ -3,8 +3,6 @@ import { join } from "node:path";
 import { readAuthorDownloadQueue } from "./author-sync.ts";
 import { downloadWorks } from "./downloader.ts";
 import { errorMessage } from "./shared.ts";
-import { findDownloadedWorkFolders } from "./archive-service.ts";
-import { workCodeOf } from "./domain/work-code.ts";
 import { AUTHOR_DOWNLOAD_FAILURES_FILE_NAME } from "./constants.ts";
 
 if (import.meta.main) {
@@ -17,10 +15,9 @@ if (import.meta.main) {
       validateOutputDirectory(config);
       await ensureDirectory(config.downloadDir, "downloadDir");
       const queue = await readAuthorDownloadQueue(config);
-      const roots = [config.asmrDir, config.downloadDir];
-      const savedCodes = new Set((await Promise.all(roots.map((root) => findDownloadedWorkFolders(root))))
-        .flatMap((items) => items.map(workCodeOf)));
-      const pending = queue.filter((item) => item.reason === "incomplete" || !savedCodes.has(item.workCode));
+      // downloadWorks checks the exact destination (downloadDir/author/workCode).
+      // Another author's copy must not suppress this author's destination.
+      const pending = queue;
       // A failed resource is skipped immediately; the next invocation retries it.
       const downloadConfig = { ...config, maxRetries: 0 };
       const result = await downloadWorks(pending.map((item) => ({

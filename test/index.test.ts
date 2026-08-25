@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   buildDownloadFilePlan,
+  buildAuthorDownloadList,
   buildAuthorSearchKeywords,
   buildDeletionPlan,
   buildDeletionQueue,
@@ -406,6 +407,31 @@ describe("非该作者作品清单", () => {
 });
 
 describe("API 路径", () => {
+  test("作者下载队列表同时提供可读的 TSV 表单", () => {
+    expect(buildAuthorDownloadList([
+      {
+        author: "作者\t甲",
+        workCode: "RJ1",
+        workId: 1,
+        reason: "missing",
+        source: "作品\n标题",
+      },
+      {
+        author: "作者乙",
+        workCode: "VJ01005847",
+        workId: 100000063,
+        reason: "incomplete",
+        source: "D:/voice/VJ01005847.7z",
+        missingFiles: ["track.wav"],
+      },
+    ])).toBe([
+      "作者\t作品ID\t原因\t来源\t缺失文件",
+      "作者 甲\tRJ1\t遗漏\t作品 标题\t",
+      "作者乙\tVJ01005847\t7z不完整\tD:/voice/VJ01005847.7z\ttrack.wav",
+      "",
+    ].join("\n"));
+  });
+
   test("author 只生成 circle 和 va 精确搜索词", () => {
     expect(buildAuthorSearchKeywords(" 稻草人 ")).toEqual([
       "$circle:稻草人$",

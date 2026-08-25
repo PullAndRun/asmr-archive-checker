@@ -1,9 +1,14 @@
-import { readdir, mkdir } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createRequestThrottle, fetchWorksForAuthor, workCodeFromSearchWork } from "./api.ts";
 import { checkArchive, classifyArchives, findDownloadedWorkFolders, findArchives } from "./archive-service.ts";
-import { AUTHOR_DOWNLOAD_QUEUE_FILE_NAME, AUTHOR_FIND_REPORT_FILE_NAME, AUTHOR_SKIPPED_FILE_NAME } from "./constants.ts";
-import { type IncompleteArchive } from "./domain/records.ts";
+import {
+  AUTHOR_DOWNLOAD_LIST_FILE_NAME,
+  AUTHOR_DOWNLOAD_QUEUE_FILE_NAME,
+  AUTHOR_FIND_REPORT_FILE_NAME,
+  AUTHOR_SKIPPED_FILE_NAME,
+} from "./constants.ts";
+import { sanitizeColumn, type IncompleteArchive } from "./domain/records.ts";
 import { normalizeWorkCode, workCodeOf, type WorkCode } from "./domain/work-code.ts";
 import { ensureDirectory, requireDirectory, validateOutputDirectory } from "./config.ts";
 import { mapLimit, errorMessage } from "./shared.ts";
@@ -31,6 +36,21 @@ export type AuthorFindReport = {
   errors: Array<{ author: string; error: string }>;
 };
 
+/** Human-readable companion to author-download-queue.json. */
+export function buildAuthorDownloadList(queue: AuthorQueueItem[]): string {
+  const lines = [
+    "作者\t作品ID\t原因\t来源\t缺失文件",
+    ...queue.map((item) => [
+      sanitizeColumn(item.author),
+      item.workCode,
+      item.reason === "incomplete" ? "7z不完整" : "遗漏",
+      sanitizeColumn(item.source),
+      sanitizeColumn(item.missingFiles?.join("、") ?? ""),
+    ].join("\t")),
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
 type AuthorInfo = { name: string; path: string; works: SearchWork[] };
 
 async function listAuthors(root: string): Promise<Array<{ name: string; path: string }>> {
@@ -48,6 +68,7 @@ export async function findAuthorDownloads(config: Config): Promise<AuthorFindRep
   await requireDirectory(config.asmrDir, "asmrDir");
   const authors = await listAuthors(config.asmrDir);
   if (authors.length === 0) throw new Error("asmrDir does not contain any author directories");
+  logger.info(`find: found ${authors.length} author directories; reading API catalogues...`);
   const throttle = createRequestThrottle(config.syncQps);
   const errors: Array<{ author: string; error: string }> = [];
   const skippedAuthors: AuthorFindReport["skippedAuthors"] = [];
@@ -104,7 +125,14 @@ export async function findAuthorDownloads(config: Config): Promise<AuthorFindRep
     assigned.set(code, entries[0]);
   }
 
-  const scanRoots = [config.asmrDir, ...(config.downloadDir ? [config.downloadDir] : [])];
+  // Mode one is author-folder based: archives directly under the collection
+  // root are not attributed to any author. Download output is scanned as a
+  // whole because it is already written in author/work-code layout.
+  const scanRoots = [
+    ...authors.map((author) => author.path),
+    ...(config.downloadDir ? [config.downloadDir] : []),
+  ];
+  logger.info(`find: scanning local 7z files in ${scanRoots.length} location(s)...`);
   const localScans = await Promise.all(scanRoots.map(async (root) => {
     try {
       const [archives, folders] = await Promise.all([findArchives(root), findDownloadedWorkFolders(root)]);
@@ -117,13 +145,24 @@ export async function findAuthorDownloads(config: Config): Promise<AuthorFindRep
   const archivePaths = [...new Set(localScans.flatMap((scan) => scan.archives))];
   const folderCodes = new Set(localScans.flatMap((scan) => scan.folders.map((folder) => keyOf(workCodeOf(folder)))));
   const recognized = classifyArchives(archivePaths).recognized;
-  const archiveResults = await mapLimit(recognized, config.concurrency, async (archive) => {
+  logger.info(`find: found ${archivePaths.length} 7z file(s); checking ${recognized.length} recognized archive(s) against API file lists...`);
+  const archiveResults = await mapLimit(recognized, config.concurrency, async (archive, index) => {
     const match = assigned.get(keyOf(archive.workCode));
-    if (!match) return { archive, result: undefined };
-    return {
-      archive,
-      result: await checkArchive(archive.path, archive.workCode, config, match.work.id, throttle),
-    };
+    const progress = `[${index + 1}/${recognized.length}]`;
+    if (!match) {
+      logger.info(`${progress} skipping 7z outside selected author catalogues: ${archive.path}`);
+      return { archive, result: undefined };
+    }
+    logger.info(`${progress} checking 7z against API file list: ${archive.path}`);
+    const result = await checkArchive(archive.path, archive.workCode, config, match.work.id, throttle);
+    if (!result) {
+      logger.info(`${progress} complete: ${archive.path}`);
+    } else if (result.error) {
+      logger.warn(`${progress} check failed: ${archive.path}: ${result.error}`);
+    } else {
+      logger.warn(`${progress} incomplete: ${archive.path} (${result.missingFiles.length} missing file(s)); queued for full download`);
+    }
+    return { archive, result };
   });
   const incompleteCodes = new Set<string>();
   const incomplete: Array<IncompleteArchive & { author: string }> = [];
@@ -188,6 +227,7 @@ export async function writeAuthorFindResults(config: Config, report: AuthorFindR
   await Promise.all([
     Bun.write(join(config.outputDir, AUTHOR_FIND_REPORT_FILE_NAME), `${JSON.stringify(report, null, 2)}\n`),
     Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_QUEUE_FILE_NAME), `${JSON.stringify(report.queue, null, 2)}\n`),
+    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_LIST_FILE_NAME), buildAuthorDownloadList(report.queue)),
     Bun.write(join(config.outputDir, AUTHOR_SKIPPED_FILE_NAME), `${JSON.stringify(report.skippedAuthors, null, 2)}\n`),
   ]);
 }
