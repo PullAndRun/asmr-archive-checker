@@ -70,6 +70,7 @@ export type DownloadResult = {
   error?: string;
   retryAfterMinutes?: number;
   retryAfterAt?: string;
+  rateLimited?: boolean;
 };
 
 export type DownloadTarget = { workId: number; displayId: string; author?: string };
@@ -79,5 +80,6 @@ export type DownloadBatchResult = {
   downloadedSize: number;
   stoppedByLimit: boolean;
   stoppedByServiceUnavailable: boolean;
+  stoppedByRateLimit: boolean;
   remainingCount: number;
 };

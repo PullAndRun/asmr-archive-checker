@@ -45,7 +45,7 @@ Copy-Item config.example.json config.json
   "sevenZipPath": "7z",
   "maxDownloadSize": "100 GB",
   "concurrency": 4,
-  "maxWorkers": 4,
+  "maxWorkers": 1,
   "maxRetries": 3,
   "proxyUrl": "",
   "apiUrls": ["https://api.asmr-200.com", "https://api.asmr-100.com"],
@@ -63,11 +63,11 @@ Copy-Item config.example.json config.json
 - `sevenZipPath`：7-Zip 命令或完整路径；
 - `maxDownloadSize`：单次运行允许完成下载的最大总体积，例如 `"100 GB"`。支持 B、KB、MB、GB、TB（按 1024 换算）；设为 `""` 表示不限制；
 - `concurrency`：API 和压缩包检查的并发数，范围 1–20；
-- `maxWorkers`：同一部作品内同时下载的最大文件数，范围 1–20；
-- `maxRetries`：API 或单个文件请求失败后的最大重试次数，范围 0–20；
+- `maxWorkers`：保留的并发配置项；网页式媒体下载固定按文件顺序串行请求，建议设为 `1`；
+- `maxRetries`：API 请求失败后的最大重试次数，范围 0–20；网页式媒体文件请求不自动重试；
 - `proxyUrl`：API 和文件下载使用的代理地址；设为 `""` 表示不使用代理；
 - `syncQps`：API 请求速率上限，范围大于 0 且不超过 100；
-- `requestTimeoutMs`：API 请求以及每个文件分段的连接/无数据等待超时毫秒数。
+- `requestTimeoutMs`：API 请求以及每个完整媒体文件的连接/无数据等待超时毫秒数。
 - `archiveTimeoutMs`：单个压缩包执行 7-Zip 列表检查的超时毫秒数，默认 300000（5 分钟）。
 
 相对路径均以配置文件所在目录为基准。
@@ -172,7 +172,7 @@ bun run author -- --asmr-dir "D:\asmr"
 - `author` 模式会把作者作品列表之外、且能从名称识别 `*J` 来源编号的本地压缩包和作品文件夹写入单独清单；
 - `download` 模式逐行读取汇总，下载完整作品；
 - 搜索结果存在、但站点文件列表返回 404 的作品会标记为“站点暂无资源”并跳过，不会作为普通失败重复下载；
-- 文件资源使用 8 MiB 的有界 HTTP Range 分段下载；每段独立校验 `Content-Range`、声明大小和实际大小，临时错误只重试当前分段；不支持 Range 的普通服务器仍可返回一次完整的 `200` 响应；
+- 文件资源按网页下载器方式逐个使用完整 HTTP GET 流式下载，不发送 Range，也不在媒体请求失败后自动重试；每个文件都会校验声明大小和实际写入大小，单个文件失败即停止当前作品；
 - 设置下载体积限制后，每部作品完成时累计其文件夹体积；达到限制后停止开始下一部作品，不会切断当前作品；
 - 下载先进入 `downloadDir/.asmr-archive-checker-downloads` 下的临时目录，成功后移动并改名为真实来源编号；Windows 非法文件名字符会替换为 `_`；
 - 标准名称的目标文件夹已经存在时会跳过，不覆盖已有文件；失败时保留每部作品固定的临时目录，再次运行会校验文件大小并续传尚未完成的文件。旧版本生成的随机临时目录也会自动选择数据最多的一份继续下载。
@@ -227,4 +227,4 @@ Authors whose API list cannot be fetched are written to `output/author-skipped.j
 
 If a download reports HTTP 429 with a long `Retry-After`, the limit is from the media file server, not the API endpoint. API failover cannot change that media URL; rerun after the indicated delay.
 
-For `kiko-play-niptan.one` media, the downloader serializes files and spaces Range requests to reduce server-side rate limiting. Retry information is recorded in minutes in `output/author-download-failures.json`.
+Media files use the same serialized, one-full-file-request flow as the website. On HTTP 429 or Cloudflare 1015, the current queue stops immediately instead of continuing to hit the limited host. Retry information is recorded in minutes in `output/author-download-failures.json`.

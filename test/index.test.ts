@@ -15,6 +15,7 @@ import {
   deleteNonAuthorWorks,
   DOWNLOAD_RANGE_CHUNK_BYTES,
   downloadUrlToFileInRanges,
+  downloadUrlToFileInSingleRequest,
   downloadWorks,
   ensureSafeDownloadDirectory,
   buildNonAuthorWorkList,
@@ -188,35 +189,20 @@ describe("下载器调用", () => {
     expect(parseContentRange(null)).toBeUndefined();
   });
 
-  test("使用有界 Range 分段下载并重试单个失败分段", async () => {
+  test("使用一次完整文件请求并且不发送 Range", async () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-range-test-"));
     const path = join(root, "response.bin");
     const size = DOWNLOAD_RANGE_CHUNK_BYTES * 2 + 17;
     const data = new Uint8Array(size);
     for (let index = 0; index < data.length; index += 1) data[index] = index % 251;
     const ranges: string[] = [];
-    let firstRequest = true;
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       fetch(request) {
         const range = request.headers.get("range") ?? "";
         ranges.push(range);
-        if (firstRequest) {
-          firstRequest = false;
-          return new Response(null, { status: 503, headers: { "Retry-After": "0" } });
-        }
-        const match = /^bytes=(\d+)-(\d+)$/.exec(range);
-        if (!match) return new Response(null, { status: 400 });
-        const start = Number(match[1]);
-        const end = Math.min(Number(match[2]), data.length - 1);
-        return new Response(data.slice(start, end + 1), {
-          status: 206,
-          headers: {
-            "Content-Length": String(end - start + 1),
-            "Content-Range": `bytes ${start}-${end}/${data.length}`,
-          },
-        });
+        return new Response(data, { headers: { "Content-Length": String(data.length) } });
       },
     });
     try {
@@ -225,12 +211,7 @@ describe("下载器调用", () => {
         maxRetries: 1,
         proxyUrl: "",
       })).toBe(data.length);
-      expect(ranges).toEqual([
-        `bytes=0-${DOWNLOAD_RANGE_CHUNK_BYTES - 1}`,
-        `bytes=0-${DOWNLOAD_RANGE_CHUNK_BYTES - 1}`,
-        `bytes=${DOWNLOAD_RANGE_CHUNK_BYTES}-${DOWNLOAD_RANGE_CHUNK_BYTES * 2 - 1}`,
-        `bytes=${DOWNLOAD_RANGE_CHUNK_BYTES * 2}-${data.length - 1}`,
-      ]);
+      expect(ranges).toEqual([""]);
       const actual = new Uint8Array(await Bun.file(path).arrayBuffer());
       expect(actual.length).toBe(data.length);
       for (const index of [0, DOWNLOAD_RANGE_CHUNK_BYTES - 1, DOWNLOAD_RANGE_CHUNK_BYTES, data.length - 1]) {
@@ -306,6 +287,58 @@ describe("download timeout URL", () => {
         maxRetries: 0,
         proxyUrl: "",
       }, 1)).rejects.toThrow(url);
+    } finally {
+      await server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("downloads media with one request and no Range header", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-single-download-test-"));
+    const path = join(root, "response.bin");
+    const data = new Uint8Array([1, 2, 3]);
+    let rangeHeader: string | null = "unexpected";
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        rangeHeader = request.headers.get("range");
+        return new Response(data, { headers: { "Content-Length": String(data.length) } });
+      },
+    });
+    try {
+      expect(await downloadUrlToFileInSingleRequest(server.url.toString(), path, {
+        requestTimeoutMs: 1_000,
+        maxRetries: 0,
+        proxyUrl: "",
+      }, data.length)).toBe(data.length);
+      expect(rangeHeader).toBeNull();
+      expect(new Uint8Array(await Bun.file(path).arrayBuffer())).toEqual(data);
+    } finally {
+      await server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recognizes a Cloudflare 1015 page as a rate limit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-cloudflare-rate-limit-test-"));
+    const path = join(root, "response.bin");
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        return new Response("Error 1015: You are being rate limited", {
+          status: 403,
+          headers: { server: "cloudflare" },
+        });
+      },
+    });
+    try {
+      await expect(downloadUrlToFileInSingleRequest(server.url.toString(), path, {
+        requestTimeoutMs: 1_000,
+        maxRetries: 0,
+        proxyUrl: "",
+      })).rejects.toThrow("HTTP 429");
     } finally {
       await server.stop(true);
       await rm(root, { recursive: true, force: true });
@@ -872,6 +905,35 @@ describe("下载体积限制", () => {
     expect(batch.stoppedByServiceUnavailable).toBeTrue();
     expect(batch.remainingCount).toBe(2);
     expect(batch.results).toMatchObject([{ status: "failed", error: "资源下载失败" }]);
+  });
+
+  test("stops the queue when a media host is rate limited", async () => {
+    const config = {
+      author: "",
+      archiveDir: ".",
+      asmrDir: ".",
+      downloadDir: ".",
+      outputDir: "./output",
+      sevenZipPath: "7z",
+      concurrency: 1,
+      maxWorkers: 1,
+      maxRetries: 3,
+      proxyUrl: "",
+      syncQps: 2,
+      requestTimeoutMs: 30_000,
+      maxDownloadSize: "",
+    };
+    const started: number[] = [];
+    const batch = await downloadWorks([1, 2, 3], config, async (workId) => {
+      started.push(workId);
+      return workId === 1
+        ? { workId, displayId: formatWorkId(workId), status: "failed", error: "HTTP 429", rateLimited: true }
+        : { workId, displayId: formatWorkId(workId), status: "downloaded", size: 1 };
+    });
+
+    expect(started).toEqual([1]);
+    expect(batch.stoppedByRateLimit).toBeTrue();
+    expect(batch.remainingCount).toBe(2);
   });
 });
 

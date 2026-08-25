@@ -28,10 +28,16 @@ if not defined SEVENZIP (
 )
 
 rem ============================================================
-rem Use the BAT file directory
+rem Use the optional target directory, or the BAT file directory
 rem ============================================================
 
-pushd "%~dp0"
+set "TARGET_DIR=%~1"
+
+if not defined TARGET_DIR (
+    set "TARGET_DIR=%~dp0"
+)
+
+pushd "%TARGET_DIR%"
 
 if errorlevel 1 (
     echo.
@@ -54,6 +60,7 @@ echo Solid mode    : Enabled
 echo Sort by type  : Enabled
 echo Threads       : Automatic
 echo Archive test  : Disabled
+echo Target folder : "%CD%"
 echo.
 echo Source folders will not be deleted.
 echo Existing archives will be replaced only after the new

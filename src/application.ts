@@ -62,7 +62,7 @@ const runDownload = async (config: Config): Promise<void> => {
   logger.info(`下载目录：${config.downloadDir}`);
   logger.info(`待下载作品：${targets.length} 个`);
   logger.info(`本次下载体积限制：${config.maxDownloadSizeBytes === undefined ? "不限制" : formatFileSize(config.maxDownloadSizeBytes)}`);
-  const batch = await downloadWorks(targets, config);
+  const batch = await downloadWorks(targets, config, undefined, { retryFailedWorks: false });
   const downloads = batch.results;
   logger.info(
     `本次结束：下载成功 ${downloads.filter((item) => item.status === "downloaded").length} 个，` +
@@ -74,6 +74,9 @@ const runDownload = async (config: Config): Promise<void> => {
   if (batch.stoppedByLimit && batch.remainingCount > 0) logger.info(`因达到体积限制停止，队列中还有 ${batch.remainingCount} 部作品未开始。`);
   if (batch.stoppedByServiceUnavailable && batch.remainingCount > 0) {
     logger.warn(`因资源服务器不可用停止，队列中还有 ${batch.remainingCount} 部作品未开始。`);
+  }
+  if (batch.stoppedByRateLimit && batch.remainingCount > 0) {
+    logger.warn(`因媒体服务器限流停止，队列中还有 ${batch.remainingCount} 部作品未开始；请等待限流窗口结束后再运行。`);
   }
   if (downloads.some((item) => item.status === "failed")) process.exitCode = 2;
 };

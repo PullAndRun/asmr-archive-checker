@@ -47,6 +47,9 @@ if (import.meta.main) {
       await ensureDirectory(config.outputDir, "outputDir");
       await Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_FAILURES_FILE_NAME), `${JSON.stringify(failures, null, 2)}\n`);
       console.log(`download complete: ${result.results.filter((item) => item.status === "downloaded").length} works downloaded`);
+      if (result.stoppedByRateLimit && result.remainingCount > 0) {
+        console.warn(`media server rate limit reached; ${result.remainingCount} works remain. Wait for the limit window to end before retrying.`);
+      }
       if (result.results.some((item) => item.status === "failed")) process.exitCode = 2;
     }
   } catch (error) {

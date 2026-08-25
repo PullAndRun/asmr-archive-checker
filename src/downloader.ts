@@ -6,7 +6,7 @@ import { buildDownloadFilePlan, sanitizeDownloadPathSegment, type DownloadFile, 
 import { formatFileSize, hasReachedDownloadSizeLimit } from "./domain/size.ts";
 import { formatWorkId } from "./domain/work-code.ts";
 import { directorySize, pathExists } from "./fs-utils.ts";
-import { findHttpResponseError, httpErrorFromResponse, isRetryableRequestError, retryDelayMilliseconds } from "./http.ts";
+import { findHttpResponseError, httpErrorFromResponse } from "./http.ts";
 import { containsPath, errorMessage, mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type {
@@ -21,24 +21,104 @@ export function isCompleteDownloadFile(actualSize: number, expectedSize?: number
   return expectedSize === undefined || actualSize === expectedSize;
 }
 
+/** Kept for API compatibility with callers that imported the old range size. */
 export const DOWNLOAD_RANGE_CHUNK_BYTES = 8 * 1024 ** 2;
-const KIKO_MEDIA_REQUEST_INTERVAL_MS = 1_500;
-let nextKikoMediaRequestAt = 0;
 
-function isKikoMediaUrl(url: string): boolean {
-  try {
-    return new URL(url).hostname.toLowerCase().endsWith(".kiko-play-niptan.one");
-  } catch {
-    return false;
+async function downloadResponseError(response: Response): Promise<Error> {
+  if (response.status === 403) {
+    const body = await response.clone().text().catch(() => "");
+    if (/error\s*1015|being rate limited/i.test(body)) {
+      const headers = new Headers();
+      const retryAfter = response.headers.get("retry-after");
+      if (retryAfter) headers.set("retry-after", retryAfter);
+      return httpErrorFromResponse(new Response(null, { status: 429, headers }));
+    }
   }
+  return httpErrorFromResponse(response);
 }
 
-async function waitForKikoMediaRequest(url: string): Promise<void> {
-  if (!isKikoMediaUrl(url)) return;
-  const now = performance.now();
-  const delay = Math.max(0, nextKikoMediaRequestAt - now);
-  nextKikoMediaRequestAt = Math.max(now, nextKikoMediaRequestAt) + KIKO_MEDIA_REQUEST_INTERVAL_MS;
-  if (delay > 0) await Bun.sleep(delay);
+export async function downloadUrlToFileInSingleRequest(
+  url: string,
+  path: string,
+  config: Pick<Config, "requestTimeoutMs" | "maxRetries" | "proxyUrl">,
+  expectedSize?: number,
+): Promise<number> {
+  if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
+    throw new Error(`预期下载大小无效：${expectedSize}`);
+  }
+  const file = await open(path, "wx", 0o600);
+  let lastError: unknown;
+  try {
+    // The website downloader makes one request per file. Do not replay a media
+    // request from the CLI, because a retry is another rate-limit signal.
+    {
+      const controller = new AbortController();
+      let response: Response | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let connectionTimedOut = false;
+      try {
+        timer = setTimeout(() => {
+          connectionTimedOut = true;
+          controller.abort();
+        }, config.requestTimeoutMs);
+        response = await fetch(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            Accept: "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            Referer: "https://www.asmr.one/",
+            Origin: "https://www.asmr.one",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+          },
+          signal: controller.signal,
+          ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
+        });
+        clearTimeout(timer);
+        timer = undefined;
+        if (!response.ok) throw await downloadResponseError(response);
+        if (response.status !== 200) throw new Error(`partial media response: HTTP ${response.status}; 分段响应范围不符`);
+
+        const lengthHeader = response.headers.has("content-encoding")
+          ? null
+          : response.headers.get("content-length");
+        const responseSize = lengthHeader && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : undefined;
+        if (responseSize !== undefined && (!Number.isSafeInteger(responseSize) || responseSize < 0)) {
+          throw new Error(`响应文件大小无效：${lengthHeader}`);
+        }
+        if (expectedSize !== undefined && responseSize !== undefined && responseSize !== expectedSize) {
+          throw new Error(`响应文件大小不符：预期 ${expectedSize}，响应声明 ${responseSize}`);
+        }
+        const received = await writeResponseBodyToHandle(
+          response,
+          file,
+          controller,
+          config.requestTimeoutMs,
+          0,
+          expectedSize ?? responseSize,
+        );
+        const completeSize = expectedSize ?? responseSize;
+        if (completeSize !== undefined && received !== completeSize) {
+          throw new Error(`下载响应提前结束：预期 ${completeSize}，实际 ${received}`);
+        }
+        return received;
+      } catch (error) {
+        const requestError = connectionTimedOut
+          ? new Error(`下载连接超过 ${config.requestTimeoutMs} 毫秒未响应：${url}`)
+          : error;
+        lastError = requestError;
+        await file.truncate(0);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        controller.abort();
+        if (response?.body && !response.body.locked) await response.body.cancel().catch(() => undefined);
+      }
+    }
+    throw new Error(`下载文件失败：${errorMessage(lastError)}`, { cause: lastError });
+  } finally {
+    await file.close();
+  }
 }
 
 class TrackListUnavailableError extends Error {
@@ -180,6 +260,10 @@ export async function downloadUrlToFileInRanges(
   if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
     throw new Error(`预期下载大小无效：${expectedSize}`);
   }
+  // Kept as a compatibility wrapper for the old exported name. The browser
+  // flow always downloads each media file with one complete GET request.
+  return downloadUrlToFileInSingleRequest(url, path, config, expectedSize);
+  /* Legacy Range implementation intentionally disabled.
   const file = await open(path, "wx", 0o600);
   let position = 0;
   let totalSize = expectedSize;
@@ -206,7 +290,7 @@ export async function downloadUrlToFileInRanges(
             headers: {
               Range: `bytes=${position}-${requestedEnd}`,
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-              Accept: "*/*",
+              Accept: "* / *",
               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
               Referer: "https://www.asmr.one/",
               Origin: "https://www.asmr.one",
@@ -219,7 +303,7 @@ export async function downloadUrlToFileInRanges(
           });
           clearTimeout(timer);
           timer = undefined;
-          if (!response.ok) throw httpErrorFromResponse(response);
+          if (!response.ok) throw await downloadResponseError(response);
 
           const lengthHeader = response.headers.has("content-encoding")
             ? null
@@ -313,6 +397,7 @@ export async function downloadUrlToFileInRanges(
   } finally {
     await file.close();
   }
+  */
 }
 
 const downloadFile = async (file: DownloadFile, root: string, config: Config): Promise<"downloaded" | "skipped"> => {
@@ -336,7 +421,7 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
   }
   try {
     await rm(partialPath, { force: true });
-    const downloadedSize = await downloadUrlToFileInRanges(file.url, partialPath, config, file.size);
+    const downloadedSize = await downloadUrlToFileInSingleRequest(file.url, partialPath, config, file.size);
     if (file.size !== undefined && downloadedSize !== file.size) {
       throw new Error(`文件大小不符：预期 ${file.size}，实际 ${downloadedSize}`);
     }
@@ -394,12 +479,13 @@ const downloadWithBuiltin = async (
   if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
   const files = buildDownloadFilePlan(trackTree);
   if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
-  const kikoMedia = files.some((file) => isKikoMediaUrl(file.url));
-  const workerCount = kikoMedia ? 1 : config.maxWorkers;
-  logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${workerCount}${kikoMedia ? "（媒体服务器节流）" : ""}`);
+  // The website downloads a work's files in list order, one complete request
+  // at a time. Keep the same request shape for every media host.
+  const workerCount = 1;
+  logger.info(`内置下载器：全部 ${files.length} 个资源，并发 ${workerCount}（完整文件单请求，按顺序下载）`);
   let processed = 0;
   let reused = 0;
-  const errors = await mapLimit(files, workerCount, async (file) => {
+  await mapLimit(files, workerCount, async (file) => {
     try {
       const status = await downloadFile(file, stagingPath, config);
       if (status === "skipped") reused += 1;
@@ -407,19 +493,10 @@ const downloadWithBuiltin = async (
       logger.info(`[${processed}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);
       return undefined;
     } catch (error) {
-      if (findHttpResponseError(error)?.status === 503) throw error;
-      const message = errorMessage(error);
-      processed += 1;
-      logger.warn(`[${processed}/${files.length}] 失败 ${file.relativePath}：${message}`);
-      return { message, cause: error };
+      // Match the website: the work stops as soon as one file fails.
+      throw error;
     }
   });
-  const failures = errors.filter((error): error is { message: string; cause: unknown } =>
-    typeof error === "object" && error !== null && "message" in error && "cause" in error);
-  if (failures.length > 0) {
-    throw new Error(`${failures.length} files failed; first error: ${failures[0].message}`, { cause: failures[0].cause });
-  }
-  if (failures.length > 0) throw new Error(`${failures.length} 个文件下载失败；首个错误：${failures[0]}`);
   if (reused > 0) logger.info(`复用了 ${reused} 个已下载文件`);
 };
 
@@ -475,12 +552,14 @@ const downloadWork = async (
     if (findHttpResponseError(error)?.status === 503) {
       throw new Error(`作品 ${displayId}：${errorMessage(error)}`, { cause: error });
     }
+    const rateLimited = responseError?.status === 429;
     return {
       workId,
       displayId,
       status: "failed",
       stagingPath,
       error: errorMessage(error),
+      ...(rateLimited ? { rateLimited: true } : {}),
       ...(retryAfterMinutes !== undefined ? { retryAfterMinutes } : {}),
       ...(responseError?.retryAfterAt ? { retryAfterAt: responseError.retryAfterAt } : {}),
     };
@@ -512,9 +591,11 @@ export async function downloadWorks(
   const runSafely = async (entry: typeof entries[number]): Promise<{
     result: DownloadResult;
     serviceUnavailable: boolean;
+    rateLimited: boolean;
   }> => {
     try {
-      return { result: await run(entry), serviceUnavailable: false };
+      const result = await run(entry);
+      return { result, serviceUnavailable: false, rateLimited: result.rateLimited === true };
     } catch (error) {
       const responseError = findHttpResponseError(error);
       const retryAfterMinutes = responseError?.retryAfterTotalMs === undefined
@@ -529,6 +610,7 @@ export async function downloadWorks(
           ...(responseError?.retryAfterAt ? { retryAfterAt: responseError.retryAfterAt } : {}),
         },
         serviceUnavailable: findHttpResponseError(error)?.status === 503,
+        rateLimited: findHttpResponseError(error)?.status === 429,
       };
     }
   };
@@ -536,6 +618,7 @@ export async function downloadWorks(
   let downloadedSize = 0;
   let stoppedByLimit = false;
   let stoppedByServiceUnavailable = false;
+  let stoppedByRateLimit = false;
   let attemptedCount = 0;
   let pendingRetryCount = 0;
   for (const [index, entry] of entries.entries()) {
@@ -566,10 +649,15 @@ export async function downloadWorks(
         logger.warn("资源服务器持续返回 HTTP 503，已停止本轮下载；临时文件已保留，稍后重新运行可继续下载。");
         break;
       }
+      if (outcome.rateLimited) {
+        stoppedByRateLimit = true;
+        logger.warn("媒体服务器返回 HTTP 429/Cloudflare 1015，已暂停本轮下载；请等待限流窗口结束后再运行。");
+        break;
+      }
     }
   }
   const failedIndexes = results.flatMap((result, index) => result.status === "failed" ? [index] : []);
-  if (options.retryFailedWorks !== false && !stoppedByLimit && !stoppedByServiceUnavailable && failedIndexes.length > 0) {
+  if (options.retryFailedWorks !== false && !stoppedByLimit && !stoppedByServiceUnavailable && !stoppedByRateLimit && failedIndexes.length > 0) {
     logger.warn(`首轮有 ${failedIndexes.length} 部作品失败，开始续传重试。`);
     for (const [retryIndex, resultIndex] of failedIndexes.entries()) {
       const entry = entries[resultIndex];
@@ -603,6 +691,12 @@ export async function downloadWorks(
           logger.warn("资源服务器持续返回 HTTP 503，已停止本轮下载；临时文件已保留，稍后重新运行可继续下载。");
           break;
         }
+        if (outcome.rateLimited) {
+          stoppedByRateLimit = true;
+          pendingRetryCount = failedIndexes.length - retryIndex - 1;
+          logger.warn("媒体服务器返回 HTTP 429/Cloudflare 1015，已暂停本轮下载；请等待限流窗口结束后再运行。");
+          break;
+        }
       }
     }
   }
@@ -612,6 +706,7 @@ export async function downloadWorks(
     downloadedSize,
     stoppedByLimit,
     stoppedByServiceUnavailable,
+    stoppedByRateLimit,
     remainingCount: unattemptedCount + pendingRetryCount,
   };
 }

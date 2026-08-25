@@ -7,7 +7,7 @@
   "sevenZipPath": "7z",
   "maxDownloadSize": "100 GB",
   "concurrency": 4,
-  "maxWorkers": 4,
+  "maxWorkers": 1,
   "maxRetries": 3,
   "proxyUrl": "",
   "apiUrls": [
