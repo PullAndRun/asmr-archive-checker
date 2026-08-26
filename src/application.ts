@@ -56,6 +56,7 @@ const runDownload = async (config: Config): Promise<void> => {
     workCodes,
     config,
     createRequestThrottle(config.syncQps),
+    config.author,
   );
   await replaceOutputDirectory(config.outputDir, (stagingDir) => restoreOutputSnapshot(stagingDir, snapshot));
   logger.info("模式：download");

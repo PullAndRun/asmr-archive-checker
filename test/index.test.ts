@@ -46,6 +46,7 @@ import {
   replaceOutputDirectory,
   retryAfterMilliseconds,
   retryDelayMilliseconds,
+  resolveDownloadTargets,
   scanLocalCollection,
   sanitizeDownloadPathSegment,
   normalizeWorkCode,
@@ -529,6 +530,29 @@ describe("命令行参数", () => {
       mode: "download",
       maxDownloadSize: "1.5 GB",
     });
+  });
+
+  test("legacy 下载目标携带作者目录", async () => {
+    const config = {
+      author: "作者甲",
+      archiveDir: ".",
+      asmrDir: ".",
+      downloadDir: ".",
+      outputDir: "./output",
+      sevenZipPath: "7z",
+      concurrency: 1,
+      maxWorkers: 1,
+      maxRetries: 0,
+      proxyUrl: "",
+      syncQps: 2,
+      requestTimeoutMs: 30_000,
+      maxDownloadSize: "",
+    };
+    await expect(resolveDownloadTargets([1602072], config)).resolves.toEqual([{
+      workId: 1602072,
+      displayId: "RJ01602072",
+      author: "作者甲",
+    }]);
   });
 
   test("读取并去重待下载汇总", () => {

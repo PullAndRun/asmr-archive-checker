@@ -715,11 +715,23 @@ export async function resolveDownloadTargets(
   workCodes: Array<number | string>,
   config: Config,
   throttle?: RequestThrottle,
+  author?: string,
 ): Promise<DownloadTarget[]> {
+  const targetAuthor = (author ?? config.author).trim() || undefined;
   return mapLimit(workCodes, config.concurrency, async (input) => {
     const workCode = typeof input === "number" ? formatWorkId(input) : input;
-    if (workCode.startsWith("RJ")) return { workId: Number(workCode.slice(2)), displayId: workCode };
+    if (workCode.startsWith("RJ")) {
+      return {
+        workId: Number(workCode.slice(2)),
+        displayId: workCode,
+        ...(targetAuthor ? { author: targetAuthor } : {}),
+      };
+    }
     const work = await fetchWorkByCode(workCode, config, throttle);
-    return { workId: work.id, displayId: workCodeFromSearchWork(work) };
+    return {
+      workId: work.id,
+      displayId: workCodeFromSearchWork(work),
+      ...(targetAuthor ? { author: targetAuthor } : {}),
+    };
   }).then((targets) => [...new Map(targets.map((target) => [target.displayId, target])).values()]);
 }

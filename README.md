@@ -95,6 +95,7 @@ bun run download-legacy
 ```
 
 也可以使用 `bun run check -- download`；这两个命令读取的是 `output/待下载的音声.txt`，不是多作者模式的 JSON 队列。
+旧版汇总下载会将作品保存到 `downloadDir/<作者>/<作品编号>`，其中作者名来自当前配置的 `author`；可用 `--author` 临时覆盖。
 
 因此，同一作品即使属于多个作者，只要它的压缩包存在于 `asmrDir` 下任意作者目录，就不会被重复加入待下载队列。`archiveDir` 中本次确认不完整、且资料库中没有另一份压缩包的作品仍会保留在队列中，以便重新下载。
 
