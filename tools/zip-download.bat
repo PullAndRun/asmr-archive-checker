@@ -105,44 +105,27 @@ rem batch processing.
 call "%ZIP_BAT%" "%AUTHOR_DIR%" <nul
 
 if errorlevel 1 (
-    echo FAILED: Compression failed for "%AUTHOR_NAME%". No RJ* folder was deleted.
+    echo FAILED: Compression failed for "%AUTHOR_NAME%". Folders completed before the failure may have been deleted.
     set /a FAILED+=1
     exit /b 1
 )
+
+rem zip.bat removes each source folder after installing its archive.
+set "REMAINING_WORK="
 
 for /f "delims=" %%R in ('dir /b /ad "%AUTHOR_DIR%\RJ*" 2^>nul') do (
-    call :DELETE_WORK "%AUTHOR_DIR%\%%R"
-    if not errorlevel 1 set /a AUTHOR_DELETED+=1
+    if not defined REMAINING_WORK set "REMAINING_WORK=%%R"
 )
 
-if not "%AUTHOR_DELETED%"=="%AUTHOR_WORKS%" (
-    echo FAILED: Not all RJ* folders could be deleted for "%AUTHOR_NAME%".
+if defined REMAINING_WORK (
+    echo FAILED: Compression reported success, but an RJ* folder remains:
+    echo "%AUTHOR_DIR%\%REMAINING_WORK%"
     set /a FAILED+=1
     exit /b 1
 )
 
+set /a AUTHOR_DELETED=AUTHOR_WORKS
+set /a WORKS_DELETED+=AUTHOR_DELETED
+
 echo SUCCESS: Compressed and deleted RJ* folders for "%AUTHOR_NAME%".
-exit /b 0
-
-
-:DELETE_WORK
-
-set "WORK_DIR=%~1"
-set "WORK_ARCHIVE=%WORK_DIR%.7z"
-
-if not exist "%WORK_ARCHIVE%" (
-    echo FAILED: Expected archive was not created:
-    echo "%WORK_ARCHIVE%"
-    exit /b 1
-)
-
-rd /s /q "%WORK_DIR%" >nul 2>&1
-
-if exist "%WORK_DIR%\" (
-    echo FAILED: Cannot delete source folder:
-    echo "%WORK_DIR%"
-    exit /b 1
-)
-
-set /a WORKS_DELETED+=1
 exit /b 0

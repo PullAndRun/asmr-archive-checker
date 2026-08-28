@@ -31,6 +31,7 @@ import {
   formatFileSize,
   formatWorkId,
   hasReachedDownloadSizeLimit,
+  isDownloadTargetComplete,
   isCompleteDownloadFile,
   httpErrorFromResponse,
   isRetryableRequestError,
@@ -39,6 +40,8 @@ import {
   parseContentRange,
   parseDeletionQueue,
   parseDownloadQueue,
+  removeDownloadQueueEntry,
+  removeMissingWorkEntry,
   parseFileSize,
   parseNonAuthorWorkList,
   parseSevenZipListing,
@@ -58,6 +61,20 @@ import {
   writeResponseBodyToFile,
 } from "../src/index.ts";
 import { mapLimit } from "../src/shared.ts";
+
+test("removes completed works from the legacy missing list", () => {
+  const missing = [
+    "ID\ttitle\trelease",
+    "RJ01602072\tfirst\t2024-01-01",
+    "BJ633449\tsecond\t2024-01-02",
+    "",
+  ].join("\n");
+  expect(removeMissingWorkEntry(missing, 1602072)).toBe([
+    "ID\ttitle\trelease",
+    "BJ633449\tsecond\t2024-01-02",
+    "",
+  ].join("\n"));
+});
 
 describe("下载器调用", () => {
   test("清理 Windows 非法文件名和保留扩展名", () => {
@@ -145,6 +162,18 @@ describe("下载器调用", () => {
       expect(selected).toBe(join(root, "RJ01000000"));
       expect(await Bun.file(join(selected, "file.txt")).text()).toBe("larger old download");
       expect(await prepareStagingPath(root, "RJ01000000")).toBe(selected);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("识别作者目录中的已完成作品文件夹", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-archive-checker-complete-target-"));
+    try {
+      await mkdir(join(root, "作者甲", "RJ01000000"), { recursive: true });
+      const target = { workId: 1_000_000, displayId: "RJ01000000" as const, author: "作者甲" };
+      expect(await isDownloadTargetComplete(target, root)).toBeTrue();
+      expect(await isDownloadTargetComplete({ ...target, displayId: "RJ01000001" }, root)).toBeFalse();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -566,6 +595,20 @@ describe("命令行参数", () => {
       "AJ01005847\t遗漏\t标题五",
       "",
     ].join("\n"))).toEqual([1602072, 1616933, "BJ633449", "VJ01005847", "AJ01005847"]);
+  });
+
+  test("从旧版待下载汇总移除已完成作品并保留其他记录", () => {
+    const queue = [
+      "作品ID\t原因\t来源",
+      "RJ01602072\t遗漏\t标题",
+      "BJ633449\t遗漏\t标题二",
+      "",
+    ].join("\n");
+    expect(removeDownloadQueueEntry(queue, 1602072)).toBe([
+      "作品ID\t原因\t来源",
+      "BJ633449\t遗漏\t标题二",
+      "",
+    ].join("\n"));
   });
 
   test("拒绝空白或损坏的待下载汇总", () => {

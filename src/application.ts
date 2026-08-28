@@ -1,17 +1,19 @@
 import { basename, join, resolve } from "node:path";
 import { createRequestThrottle, fetchAllWorks, workCodeFromSearchWork } from "./api.ts";
 import { checkArchive, classifyArchives, findArchivesInRoots, findDownloadedWorkFolders } from "./archive-service.ts";
+import { sanitizeDownloadPathSegment } from "./domain/archive.ts";
 import { ensureDirectory, loadConfig, parseArgs, requireDirectory, usage, validateOutputDirectory } from "./config.ts";
 import {
   DELETE_QUEUE_FILE_NAME,
   DOWNLOAD_QUEUE_FILE_NAME,
+  MISSING_FILE_NAME,
   NON_AUTHOR_FILE_NAME,
 } from "./constants.ts";
 import { previewAndDeleteIncomplete, previewAndDeleteNonAuthorWorks } from "./deletion.ts";
-import { findNonAuthorWorks, parseDownloadQueue, type CodedLocalWork, type IncompleteArchive } from "./domain/records.ts";
+import { findNonAuthorWorks, parseDownloadQueue, removeDownloadQueueEntry, removeMissingWorkEntry, type CodedLocalWork, type IncompleteArchive } from "./domain/records.ts";
 import { formatFileSize } from "./domain/size.ts";
 import { workCodeOf } from "./domain/work-code.ts";
-import { downloadWorks, resolveDownloadTargets } from "./downloader.ts";
+import { downloadWorks, isDownloadTargetComplete, resolveDownloadTargets } from "./downloader.ts";
 import {
   readDeletionQueue,
   readNonAuthorWorkList,
@@ -49,7 +51,28 @@ const runDownload = async (config: Config): Promise<void> => {
   const snapshot = await readOutputSnapshot(config.outputDir);
   const queueText = snapshot.get(DOWNLOAD_QUEUE_FILE_NAME);
   if (queueText === undefined) throw new Error("待下载汇总快照缺失");
-  const workCodes = parseDownloadQueue(queueText);
+  let remainingQueueText = queueText;
+  let remainingMissingText = snapshot.get(MISSING_FILE_NAME);
+  const authorName = config.author.trim();
+  const authorFolder = authorName
+    ? join(config.downloadDir, sanitizeDownloadPathSegment(authorName))
+    : config.downloadDir;
+  const downloadedFoldersAtStart = await findDownloadedWorkFolders(authorFolder);
+  let cleanedAtStart = 0;
+  for (const folder of downloadedFoldersAtStart) {
+    const completedCode = workCodeOf(folder);
+    const nextQueueText = removeDownloadQueueEntry(remainingQueueText, completedCode);
+    const nextMissingText = remainingMissingText === undefined
+      ? undefined
+      : removeMissingWorkEntry(remainingMissingText, completedCode);
+    if (nextQueueText === remainingQueueText && nextMissingText === remainingMissingText) continue;
+    remainingQueueText = nextQueueText;
+    remainingMissingText = nextMissingText;
+    cleanedAtStart += 1;
+  }
+  snapshot.set(DOWNLOAD_QUEUE_FILE_NAME, remainingQueueText);
+  if (remainingMissingText !== undefined) snapshot.set(MISSING_FILE_NAME, remainingMissingText);
+  const workCodes = parseDownloadQueue(remainingQueueText);
   await ensureDirectory(config.downloadDir, "downloadDir");
   await ensureDirectory(join(config.downloadDir, ".asmr-archive-checker-downloads"), "下载临时目录");
   const targets = await resolveDownloadTargets(
@@ -59,12 +82,66 @@ const runDownload = async (config: Config): Promise<void> => {
     config.author,
   );
   await replaceOutputDirectory(config.outputDir, (stagingDir) => restoreOutputSnapshot(stagingDir, snapshot));
+  const completeAtStart = await mapLimit(
+    targets,
+    config.concurrency,
+    (target) => isDownloadTargetComplete(target, config.downloadDir),
+  );
+  const pendingTargets = [];
+  for (const [index, target] of targets.entries()) {
+    if (completeAtStart[index]) {
+      const nextQueueText = removeDownloadQueueEntry(remainingQueueText, target.displayId);
+      const nextMissingText = remainingMissingText === undefined
+        ? undefined
+        : removeMissingWorkEntry(remainingMissingText, target.displayId);
+      if (nextQueueText !== remainingQueueText || nextMissingText !== remainingMissingText) {
+        remainingQueueText = nextQueueText;
+        remainingMissingText = nextMissingText;
+        cleanedAtStart += 1;
+      }
+    } else {
+      pendingTargets.push(target);
+    }
+  }
+  if (cleanedAtStart > 0) {
+    const writes = [Bun.write(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), remainingQueueText)];
+    if (remainingMissingText !== undefined) writes.push(Bun.write(join(config.outputDir, MISSING_FILE_NAME), remainingMissingText));
+    await Promise.all(writes);
+    logger.info(`启动时发现 ${cleanedAtStart} 部已完成作品，已从待下载和遗漏清单移除`);
+  }
   logger.info("模式：download");
   logger.info(`下载目录：${config.downloadDir}`);
-  logger.info(`待下载作品：${targets.length} 个`);
+  logger.info(`待下载作品：${pendingTargets.length} 个`);
   logger.info(`本次下载体积限制：${config.maxDownloadSizeBytes === undefined ? "不限制" : formatFileSize(config.maxDownloadSizeBytes)}`);
-  const batch = await downloadWorks(targets, config, undefined, { retryFailedWorks: false });
+  const batch = await downloadWorks(pendingTargets, config, undefined, {
+    retryFailedWorks: false,
+    onDownloaded: async (result) => {
+      const nextQueueText = removeDownloadQueueEntry(remainingQueueText, result.displayId);
+      const nextMissingText = remainingMissingText === undefined
+        ? undefined
+        : removeMissingWorkEntry(remainingMissingText, result.displayId);
+      if (nextQueueText === remainingQueueText && nextMissingText === remainingMissingText) return;
+      const writes = [Bun.write(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), nextQueueText)];
+      if (nextMissingText !== undefined) writes.push(Bun.write(join(config.outputDir, MISSING_FILE_NAME), nextMissingText));
+      await Promise.all(writes);
+      remainingQueueText = nextQueueText;
+      remainingMissingText = nextMissingText;
+    },
+  });
   const downloads = batch.results;
+  for (const result of downloads) {
+    if (result.status !== "skipped") continue;
+    const nextQueueText = removeDownloadQueueEntry(remainingQueueText, result.displayId);
+    const nextMissingText = remainingMissingText === undefined
+      ? undefined
+      : removeMissingWorkEntry(remainingMissingText, result.displayId);
+    if (nextQueueText === remainingQueueText && nextMissingText === remainingMissingText) continue;
+    const writes = [Bun.write(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), nextQueueText)];
+    if (nextMissingText !== undefined) writes.push(Bun.write(join(config.outputDir, MISSING_FILE_NAME), nextMissingText));
+    await Promise.all(writes);
+    remainingQueueText = nextQueueText;
+    remainingMissingText = nextMissingText;
+  }
   logger.info(
     `本次结束：下载成功 ${downloads.filter((item) => item.status === "downloaded").length} 个，` +
     `已存在 ${downloads.filter((item) => item.status === "skipped").length} 个，` +

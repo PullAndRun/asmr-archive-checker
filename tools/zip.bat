@@ -49,7 +49,8 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo Compress each first-level folder separately
+echo Compress each first-level folder separately, then remove its source
+echo folder only after the final archive has been installed successfully.
 echo ============================================================
 echo.
 echo Memory target : %MEM_LIMIT%
@@ -62,7 +63,7 @@ echo Threads       : Automatic
 echo Archive test  : Disabled
 echo Target folder : "%CD%"
 echo.
-echo Source folders will not be deleted.
+echo Source folders will be deleted after successful compression.
 echo Existing archives will be replaced only after the new
 echo archive has been created successfully.
 echo.
@@ -113,7 +114,7 @@ exit /b 0
 
 
 rem ============================================================
-rem Compress one first-level folder
+rem Compress one first-level folder, then remove the source folder
 rem ============================================================
 
 :COMPRESS_FOLDER
@@ -276,8 +277,28 @@ if exist "%BACKUP_ARCHIVE%" (
 )
 
 echo.
-echo SUCCESS: "%FOLDER_NAME%.7z"
+echo Archive installed: "%FOLDER_NAME%.7z"
 echo Archive testing was skipped.
+
+rem ============================================================
+rem Remove the source folder only after the final archive exists.
+rem ============================================================
+
+echo Removing source folder...
+
+rd /s /q "%SOURCE_FOLDER%" >nul 2>&1
+
+if exist "%SOURCE_FOLDER%\" (
+    echo.
+    echo FAILED: Cannot remove the source folder:
+    echo "%SOURCE_FOLDER%"
+    goto :FOLDER_FAILED
+)
+
+echo Source folder removed.
+
+echo.
+echo SUCCESS: "%FOLDER_NAME%.7z"
 
 set /a SUCCESS+=1
 exit /b 0

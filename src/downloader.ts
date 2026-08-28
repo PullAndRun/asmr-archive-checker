@@ -505,11 +505,7 @@ const downloadWork = async (
   config: Config,
 ): Promise<DownloadResult> => {
   const { workId, displayId } = target;
-  const targetPath = join(
-    config.downloadDir,
-    ...(target.author ? [sanitizeDownloadPathSegment(target.author)] : []),
-    displayId,
-  );
+  const targetPath = downloadTargetPath(target, config.downloadDir);
   if (await pathExists(targetPath)) {
     const info = await lstat(targetPath);
     if (info.isSymbolicLink()) {
@@ -566,17 +562,40 @@ const downloadWork = async (
   }
 };
 
+function downloadTargetPath(target: DownloadTarget, downloadDir: string): string {
+  return join(
+    downloadDir,
+    ...(target.author ? [sanitizeDownloadPathSegment(target.author)] : []),
+    target.displayId,
+  );
+}
+
+/** A final target directory is created only after every file in the work succeeds. */
+export async function isDownloadTargetComplete(target: DownloadTarget, downloadDir: string): Promise<boolean> {
+  const targetPath = downloadTargetPath(target, downloadDir);
+  try {
+    const info = await lstat(targetPath);
+    return info.isDirectory() && !info.isSymbolicLink();
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 type NumericDownloadOne = (workId: number, config: Config) => Promise<DownloadResult>;
 type TargetDownloadOne = (target: DownloadTarget, config: Config) => Promise<DownloadResult>;
+type DownloadWorksOptions = {
+  retryFailedWorks?: boolean;
+  onDownloaded?: (result: DownloadResult) => Promise<void> | void;
+};
 
-export function downloadWorks(workIds: number[], config: Config, downloadOne?: NumericDownloadOne): Promise<DownloadBatchResult>;
-export function downloadWorks(targets: DownloadTarget[], config: Config, downloadOne?: TargetDownloadOne): Promise<DownloadBatchResult>;
-export function downloadWorks(targets: DownloadTarget[], config: Config, downloadOne: TargetDownloadOne | undefined, options?: { retryFailedWorks?: boolean }): Promise<DownloadBatchResult>;
+export function downloadWorks(workIds: number[], config: Config, downloadOne?: NumericDownloadOne, options?: DownloadWorksOptions): Promise<DownloadBatchResult>;
+export function downloadWorks(targets: DownloadTarget[], config: Config, downloadOne?: TargetDownloadOne, options?: DownloadWorksOptions): Promise<DownloadBatchResult>;
 export async function downloadWorks(
   inputs: Array<number | DownloadTarget>,
   config: Config,
   downloadOne?: NumericDownloadOne | TargetDownloadOne,
-  options: { retryFailedWorks?: boolean } = {},
+  options: DownloadWorksOptions = {},
 ): Promise<DownloadBatchResult> {
   const entries = [...new Map(inputs.map((input) => {
     const target = typeof input === "number" ? { workId: input, displayId: formatWorkId(input) } : input;
@@ -630,6 +649,7 @@ export async function downloadWorks(
     if (result.status === "downloaded") {
       downloadedSize += result.size ?? 0;
       logger.info(`作品完成：${result.displayId}（${formatFileSize(result.size ?? 0)}）`);
+      await options.onDownloaded?.(result);
       if (hasReachedDownloadSizeLimit(downloadedSize, config.maxDownloadSizeBytes)) {
         const maxDownloadSize = config.maxDownloadSizeBytes;
         if (maxDownloadSize === undefined) throw new Error("下载体积限制状态不一致");
@@ -668,6 +688,7 @@ export async function downloadWorks(
       if (result.status === "downloaded") {
         downloadedSize += result.size ?? 0;
         logger.info(`重试完成：${result.displayId}（${formatFileSize(result.size ?? 0)}）`);
+        await options.onDownloaded?.(result);
         if (hasReachedDownloadSizeLimit(downloadedSize, config.maxDownloadSizeBytes)) {
           const maxDownloadSize = config.maxDownloadSizeBytes;
           if (maxDownloadSize === undefined) throw new Error("下载体积限制状态不一致");

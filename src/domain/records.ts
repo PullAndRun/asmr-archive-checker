@@ -40,6 +40,40 @@ export function parseDownloadQueue(text: string): Array<number | WorkCode> {
   );
 }
 
+/** Remove a completed work from a legacy download queue while preserving its format. */
+export function removeDownloadQueueEntry(text: string, completed: string | number): string {
+  const completedCode = typeof completed === "number" ? formatWorkId(completed) : normalizeWorkCode(completed);
+  if (!completedCode) throw new Error(`无法识别已完成的作品编号：${completed}`);
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  parseDownloadQueue(text);
+  const records = lines.slice(1);
+  const remainingRecords = records.filter((line) => normalizeWorkCode(line.split("\t", 1)[0].trim()) !== completedCode);
+  if (remainingRecords.length === records.length) return text;
+  const remaining = [
+    lines[0],
+    ...remainingRecords,
+  ];
+  return `${remaining.join(newline)}${newline}`;
+}
+
+/** Remove a completed work from the legacy missing-work list. */
+export function removeMissingWorkEntry(text: string, completed: string | number): string {
+  const completedCode = typeof completed === "number" ? formatWorkId(completed) : normalizeWorkCode(completed);
+  if (!completedCode) throw new Error(`无法识别已完成的作品编号：${completed}`);
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length === 0) return text;
+  const records = lines.slice(1);
+  const remainingRecords = records.filter((line) => normalizeWorkCode(line.split("\t", 1)[0].trim()) !== completedCode);
+  if (remainingRecords.length === records.length) return text;
+  const remaining = [
+    lines[0],
+    ...remainingRecords,
+  ];
+  return `${remaining.join(newline)}${newline}`;
+}
+
 export function parseDeletionQueue(text: string): IncompleteArchive[] {
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   if (lines[0] !== "作品ID\t压缩包路径") {
