@@ -53,7 +53,20 @@ export function findHttpResponseError(error: unknown): HttpResponseError | undef
   return undefined;
 }
 
+/** Bun reports a peer closing the connection with this message. */
+export function isSocketConnectionClosedUnexpectedly(error: unknown): boolean {
+  const visited = new Set<unknown>();
+  let current = error;
+  while (current instanceof Error && !visited.has(current)) {
+    if (current.message.toLowerCase().includes("the socket connection was closed unexpectedly")) return true;
+    visited.add(current);
+    current = current.cause;
+  }
+  return false;
+}
+
 export function isRetryableRequestError(error: unknown): boolean {
+  if (isSocketConnectionClosedUnexpectedly(error)) return true;
   return !isHttpResponseError(error) || error.status === 408 || error.status === 429 || error.status >= 500;
 }
 

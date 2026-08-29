@@ -53,12 +53,26 @@ function resolveApiRequestUrls(url: string, apiUrls?: readonly string[]): string
     return [url];
   }
   if (original.origin !== new URL(API_BASE_URL).origin) return [url];
-  return apiUrls.map((base) => {
+  const orderedApiUrls = apiUrlOrder.get(apiUrls) ?? apiUrls;
+  return orderedApiUrls.map((base) => {
     const endpoint = new URL(base);
     endpoint.pathname = original.pathname;
     endpoint.search = original.search;
     return endpoint.toString();
   });
+}
+
+const apiUrlOrder = new WeakMap<readonly string[], string[]>();
+
+function promoteApiUrl(apiUrls: readonly string[], successfulOrigin: string): void {
+  const currentUrls = apiUrlOrder.get(apiUrls) ?? [...apiUrls];
+  const promoted = [successfulOrigin, ...currentUrls.filter((value) => value !== successfulOrigin)];
+  apiUrlOrder.set(apiUrls, promoted);
+  // Preserve the observable config order when callers provide a mutable array.
+  if (Array.isArray(apiUrls) && !Object.isFrozen(apiUrls)) {
+    const mutable = apiUrls as string[];
+    mutable.splice(0, mutable.length, ...promoted);
+  }
 }
 
 export async function fetchJson<T>(
@@ -93,7 +107,15 @@ export async function fetchJson<T>(
         ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
       });
       if (!response.ok) throw httpErrorFromResponse(response);
-      return (await response.json()) as T;
+      const result = (await response.json()) as T;
+      // Keep a successful failover endpoint first for subsequent requests in
+      // this run. Each call still uses its own URL snapshot, so in-flight
+      // concurrent requests are unaffected by this update.
+      if (endpointIndex > 0 && config.apiUrls && requestUrls.length > 1) {
+        const successfulOrigin = new URL(requestUrl).origin;
+        promoteApiUrl(config.apiUrls, successfulOrigin);
+      }
+      return result;
     } catch (error) {
       const requestError = timedOut ? new Error(`请求超过 ${config.requestTimeoutMs} 毫秒未完成`) : error;
       lastError = requestError;
