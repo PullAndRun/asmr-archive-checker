@@ -3,6 +3,47 @@ import { fetchJson, replaceUrlOrigin, selectFastestApiUrl } from "../src/api.ts"
 import { isRetryableRequestError, isSocketConnectionClosedUnexpectedly } from "../src/http.ts";
 
 describe("API endpoint failover", () => {
+  test("keeps a separate CDN media URL instead of probing it on API origins", async () => {
+    const requested: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requested.push(String(input));
+      return new Response(new Uint8Array(8 * 1024));
+    }) as typeof fetch;
+    try {
+      const selected = await selectFastestApiUrl(
+        "https://raw.kiko-play-niptan.one/media/download/track.mp3",
+        { requestTimeoutMs: 1_000, proxyUrl: "http://127.0.0.1:7890", apiUrls: ["https://api.asmr-200.com"] },
+      );
+      expect(selected).toBeUndefined();
+      expect(requested).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("probes the media URL even with one configured API origin", async () => {
+    let requestedPath = "";
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        requestedPath = new URL(request.url).pathname;
+        return new Response(new Uint8Array(8 * 1024));
+      },
+    });
+    try {
+      const selected = await selectFastestApiUrl(
+        `${server.url}audio/track.mp3?token=test`,
+        { requestTimeoutMs: 1_000, proxyUrl: "", apiUrls: [server.url.origin] },
+      );
+      expect(selected).toBe(server.url.origin);
+      expect(requestedPath).toBe("/audio/track.mp3");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("selects the fastest API origin for media downloads", async () => {
     const payload = new Uint8Array(64 * 1024);
     const slow = Bun.serve({

@@ -87,20 +87,40 @@ export function replaceUrlOrigin(url: string, origin: string): string {
   return parsed.toString();
 }
 
-const SPEED_TEST_BYTES = 256 * 1024;
+// A short stream sample is more representative than a fixed byte count:
+// fixed-size probes finish too quickly on fast links and mostly measure
+// connection setup latency instead of sustained media throughput.
+const SPEED_TEST_DURATION_MS = 3_000;
 
 type SpeedTestConfig = Pick<Config, "requestTimeoutMs" | "proxyUrl"> & { apiUrls?: readonly string[] };
 
 async function measureUrlSpeed(url: string, config: SpeedTestConfig): Promise<number> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  let requestTimedOut = false;
+  let sampleComplete = false;
+  const sampleDurationMs = Math.min(SPEED_TEST_DURATION_MS, Math.max(100, config.requestTimeoutMs - 100));
+  const requestTimer = setTimeout(() => {
+    requestTimedOut = true;
+    controller.abort();
+  }, config.requestTimeoutMs);
+  const sampleTimer = setTimeout(() => {
+    sampleComplete = true;
+    controller.abort();
+  }, sampleDurationMs);
   const startedAt = performance.now();
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let bytes = 0;
   try {
     const response = await fetch(url, {
       headers: {
         Accept: "*/*",
         "User-Agent": "asmr-archive-checker/1.0",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        Referer: "https://www.asmr.one/",
+        Origin: "https://www.asmr.one",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
       },
       signal: controller.signal,
       ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
@@ -108,25 +128,33 @@ async function measureUrlSpeed(url: string, config: SpeedTestConfig): Promise<nu
     if (!response.ok) throw httpErrorFromResponse(response);
     if (!response.body) throw new Error("测速响应没有文件内容");
     reader = response.body.getReader();
-    let bytes = 0;
-    while (bytes < SPEED_TEST_BYTES) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
+    try {
+      while (!sampleComplete) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.byteLength;
+      }
+    } catch (error) {
+      // The sampling timer intentionally aborts the request after the short
+      // media sample. Treat that abort as success when data was received;
+      // connection/request failures still propagate to endpoint failover.
+      if (!sampleComplete || requestTimedOut || bytes <= 0) throw error;
     }
     if (bytes <= 0) throw new Error("测速响应没有返回文件数据");
     const elapsedSeconds = Math.max((performance.now() - startedAt) / 1_000, 0.001);
     return bytes / elapsedSeconds;
   } finally {
     if (reader) await reader.cancel().catch(() => undefined);
-    clearTimeout(timer);
+    clearTimeout(requestTimer);
+    clearTimeout(sampleTimer);
     controller.abort();
   }
 }
 
 /**
- * Probe the first media URL through every configured API origin and promote
- * the fastest working origin for the rest of the current download.
+ * Probe the first media URL through configured origins when those origins
+ * actually serve media, then promote the fastest one for this download.
+ * Separate CDN URLs are intentionally left untouched.
  */
 export async function selectFastestApiUrl(
   mediaUrl: string,
@@ -135,7 +163,21 @@ export async function selectFastestApiUrl(
   const apiUrls = config.apiUrls;
   if (!apiUrls || apiUrls.length === 0) return undefined;
   const candidates = [...new Set(apiUrls)];
-  if (candidates.length === 1) return candidates[0];
+  let mediaOrigin: string;
+  try {
+    mediaOrigin = new URL(mediaUrl).origin;
+  } catch {
+    return undefined;
+  }
+
+  // API origins and media/CDN origins are separate services. Rewriting a
+  // CDN URL such as raw.kiko-play-niptan.one to api.asmr-200.com produces a
+  // guaranteed 404. Only probe alternate origins when the media URL already
+  // belongs to one of the configured API hosts.
+  if (!candidates.includes(mediaOrigin)) {
+    logger.info(`Media URL uses a separate CDN (${mediaOrigin}); keeping the original media host`);
+    return undefined;
+  }
   const measured = await Promise.all(candidates.map(async (origin) => {
     try {
       const speed = await measureUrlSpeed(replaceUrlOrigin(mediaUrl, origin), config);
