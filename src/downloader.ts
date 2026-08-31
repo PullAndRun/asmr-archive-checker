@@ -1,7 +1,7 @@
 import { lstat, mkdir, open, readdir, rename, rm, stat, type FileHandle } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { API_BASE_URL } from "./constants.ts";
-import { fetchJson, fetchWorkByCode, workCodeFromSearchWork } from "./api.ts";
+import { fetchJson, fetchWorkByCode, replaceUrlOrigin, selectFastestApiUrl, workCodeFromSearchWork } from "./api.ts";
 import { buildDownloadFilePlan, sanitizeDownloadPathSegment, type DownloadFile, type TrackNode } from "./domain/archive.ts";
 import { formatFileSize, hasReachedDownloadSizeLimit } from "./domain/size.ts";
 import { formatWorkId } from "./domain/work-code.ts";
@@ -400,10 +400,16 @@ export async function downloadUrlToFileInRanges(
   */
 }
 
-const downloadFile = async (file: DownloadFile, root: string, config: Config): Promise<"downloaded" | "skipped"> => {
+const downloadFile = async (
+  file: DownloadFile,
+  root: string,
+  config: Config,
+  mediaApiUrl?: string,
+): Promise<"downloaded" | "skipped"> => {
+  const downloadUrl = mediaApiUrl ? replaceUrlOrigin(file.url, mediaApiUrl) : file.url;
   let parsedUrl: URL;
   try {
-    parsedUrl = new URL(file.url);
+    parsedUrl = new URL(downloadUrl);
   } catch {
     throw new Error(`${file.relativePath}：下载地址无效`);
   }
@@ -421,7 +427,7 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
   }
   try {
     await rm(partialPath, { force: true });
-    const downloadedSize = await downloadUrlToFileInSingleRequest(file.url, partialPath, config, file.size);
+    const downloadedSize = await downloadUrlToFileInSingleRequest(downloadUrl, partialPath, config, file.size);
     if (file.size !== undefined && downloadedSize !== file.size) {
       throw new Error(`文件大小不符：预期 ${file.size}，实际 ${downloadedSize}`);
     }
@@ -437,6 +443,19 @@ const downloadFile = async (file: DownloadFile, root: string, config: Config): P
     throw new Error(`${file.relativePath}：${errorMessage(error)}`, { cause: error });
   }
 };
+
+const mediaApiSelections = new WeakMap<Config, Promise<string | undefined>>();
+
+function selectMediaApiUrl(mediaUrl: string, config: Config): Promise<string | undefined> {
+  const cached = mediaApiSelections.get(config);
+  if (cached) return cached;
+  const selection = selectFastestApiUrl(mediaUrl, config).catch((error) => {
+    logger.warn(`Media endpoint speed test unavailable; using the original media URL: ${errorMessage(error)}`);
+    return undefined;
+  });
+  mediaApiSelections.set(config, selection);
+  return selection;
+}
 
 export async function prepareStagingPath(stagingRoot: string, displayId: string): Promise<string> {
   const stablePath = join(stagingRoot, displayId);
@@ -479,6 +498,7 @@ const downloadWithBuiltin = async (
   if (!Array.isArray(trackTree)) throw new Error("文件列表 API 返回了无法识别的数据结构");
   const files = buildDownloadFilePlan(trackTree);
   if (files.length === 0) throw new Error("网站文件列表为空，无法下载");
+  const mediaApiUrl = await selectMediaApiUrl(files[0].url, config);
   // The website downloads a work's files in list order, one complete request
   // at a time. Keep the same request shape for every media host.
   const workerCount = 1;
@@ -487,7 +507,7 @@ const downloadWithBuiltin = async (
   let reused = 0;
   await mapLimit(files, workerCount, async (file) => {
     try {
-      const status = await downloadFile(file, stagingPath, config);
+      const status = await downloadFile(file, stagingPath, config, mediaApiUrl);
       if (status === "skipped") reused += 1;
       processed += 1;
       logger.info(`[${processed}/${files.length}] ${status === "skipped" ? "已下载" : "完成"} ${file.relativePath}`);

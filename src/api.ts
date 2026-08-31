@@ -64,7 +64,7 @@ function resolveApiRequestUrls(url: string, apiUrls?: readonly string[]): string
 
 const apiUrlOrder = new WeakMap<readonly string[], string[]>();
 
-function promoteApiUrl(apiUrls: readonly string[], successfulOrigin: string): void {
+export function promoteApiUrl(apiUrls: readonly string[], successfulOrigin: string): void {
   const currentUrls = apiUrlOrder.get(apiUrls) ?? [...apiUrls];
   const promoted = [successfulOrigin, ...currentUrls.filter((value) => value !== successfulOrigin)];
   apiUrlOrder.set(apiUrls, promoted);
@@ -73,6 +73,85 @@ function promoteApiUrl(apiUrls: readonly string[], successfulOrigin: string): vo
     const mutable = apiUrls as string[];
     mutable.splice(0, mutable.length, ...promoted);
   }
+}
+
+/** Replace only the origin of a media URL, retaining its path and query. */
+export function replaceUrlOrigin(url: string, origin: string): string {
+  const parsed = new URL(url);
+  const replacement = new URL(origin);
+  parsed.protocol = replacement.protocol;
+  parsed.hostname = replacement.hostname;
+  parsed.port = replacement.port;
+  parsed.username = replacement.username;
+  parsed.password = replacement.password;
+  return parsed.toString();
+}
+
+const SPEED_TEST_BYTES = 256 * 1024;
+
+type SpeedTestConfig = Pick<Config, "requestTimeoutMs" | "proxyUrl"> & { apiUrls?: readonly string[] };
+
+async function measureUrlSpeed(url: string, config: SpeedTestConfig): Promise<number> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  const startedAt = performance.now();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "*/*",
+        "User-Agent": "asmr-archive-checker/1.0",
+      },
+      signal: controller.signal,
+      ...(config.proxyUrl ? { proxy: config.proxyUrl } : {}),
+    });
+    if (!response.ok) throw httpErrorFromResponse(response);
+    if (!response.body) throw new Error("测速响应没有文件内容");
+    reader = response.body.getReader();
+    let bytes = 0;
+    while (bytes < SPEED_TEST_BYTES) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+    }
+    if (bytes <= 0) throw new Error("测速响应没有返回文件数据");
+    const elapsedSeconds = Math.max((performance.now() - startedAt) / 1_000, 0.001);
+    return bytes / elapsedSeconds;
+  } finally {
+    if (reader) await reader.cancel().catch(() => undefined);
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+/**
+ * Probe the first media URL through every configured API origin and promote
+ * the fastest working origin for the rest of the current download.
+ */
+export async function selectFastestApiUrl(
+  mediaUrl: string,
+  config: SpeedTestConfig,
+): Promise<string | undefined> {
+  const apiUrls = config.apiUrls;
+  if (!apiUrls || apiUrls.length === 0) return undefined;
+  const candidates = [...new Set(apiUrls)];
+  if (candidates.length === 1) return candidates[0];
+  const measured = await Promise.all(candidates.map(async (origin) => {
+    try {
+      const speed = await measureUrlSpeed(replaceUrlOrigin(mediaUrl, origin), config);
+      return { origin, speed };
+    } catch (error) {
+      logger.warn(`API endpoint speed test failed: ${origin}; ${errorMessage(error)}`);
+      return undefined;
+    }
+  }));
+  const fastest = measured
+    .filter((result): result is { origin: string; speed: number } => result !== undefined)
+    .toSorted((left, right) => right.speed - left.speed)[0];
+  if (!fastest) return undefined;
+  promoteApiUrl(apiUrls, fastest.origin);
+  logger.info(`Media download endpoint selected: ${fastest.origin} (${Math.round(fastest.speed / 1024)} KiB/s)`);
+  return fastest.origin;
 }
 
 export async function fetchJson<T>(
