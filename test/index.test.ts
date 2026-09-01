@@ -41,6 +41,7 @@ import {
   parseDeletionQueue,
   parseDownloadQueue,
   removeDownloadQueueEntry,
+  removeAuthorDownloadQueueEntry,
   removeMissingWorkEntry,
   parseFileSize,
   parseNonAuthorWorkList,
@@ -60,6 +61,7 @@ import {
   writeResults,
   writeResponseBodyToFile,
 } from "../src/index.ts";
+import type { AuthorQueueItem } from "../src/index.ts";
 import { mapLimit } from "../src/shared.ts";
 
 test("removes completed works from the legacy missing list", () => {
@@ -437,6 +439,16 @@ describe("非该作者作品清单", () => {
 });
 
 describe("API 路径", () => {
+  test("从作者待下载队列移除已完成作品并保留其他作者作品", () => {
+    const queue: AuthorQueueItem[] = [
+      { author: "甲", workCode: "RJ01602072", workId: 1602072, reason: "missing" as const, source: "one" },
+      { author: "乙", workCode: "VJ01005847", workId: 100000063, reason: "incomplete" as const, source: "two" },
+    ];
+    expect(removeAuthorDownloadQueueEntry(queue, 1602072)).toEqual([queue[1]]);
+    expect(removeAuthorDownloadQueueEntry(queue, "vj01005847")).toEqual([queue[0]]);
+    expect(() => removeAuthorDownloadQueueEntry(queue, "invalid")).toThrow();
+  });
+
   test("作者下载队列表同时提供可读的 TSV 表单", () => {
     expect(buildAuthorDownloadList([
       {

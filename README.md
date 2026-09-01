@@ -136,6 +136,7 @@ bun run download-authors
 当前 `bun run download` 是这个多作者下载入口的兼容别名；旧版 `待下载的音声.txt` 汇总下载请使用上文的 `bun run download-legacy`。
 
 作品保存到 `downloadDir/<作者>/<作品编号>`。是否已下载按这个精确的作者目录判断，其他作者目录中的同编号作品不会抑制当前下载。每部作品的文件按 API 文件树全部下载，只有全部文件成功后才移动到最终目录；失败会保留临时目录，下一次运行可以继续。下载结果写入 `output/author-download-failures.json`，媒体服务器返回 429 或 Cloudflare 1015 时本轮队列会停止，等待限流窗口结束后重新运行即可。
+每部作品完整下载并移动到最终目录后，会立即从 `author-download-queue.json` 和 `作者待下载的音声.txt` 中移除；已经存在而被跳过的作品也会从队列中清理。下载中断时，尚未完成的作品仍会保留在队列中。
 
 ### 分步使用
 

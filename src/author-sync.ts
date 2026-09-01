@@ -9,7 +9,7 @@ import {
   AUTHOR_SKIPPED_FILE_NAME,
 } from "./constants.ts";
 import { sanitizeColumn, type IncompleteArchive } from "./domain/records.ts";
-import { normalizeWorkCode, workCodeOf, type WorkCode } from "./domain/work-code.ts";
+import { formatWorkId, normalizeWorkCode, workCodeOf, type WorkCode } from "./domain/work-code.ts";
 import { ensureDirectory, requireDirectory, validateOutputDirectory } from "./config.ts";
 import { mapLimit, errorMessage } from "./shared.ts";
 import { logger } from "./logger.ts";
@@ -49,6 +49,24 @@ export function buildAuthorDownloadList(queue: AuthorQueueItem[]): string {
     ].join("\t")),
   ];
   return `${lines.join("\n")}\n`;
+}
+
+/** Remove a completed work from the author download queue. */
+export function removeAuthorDownloadQueueEntry(
+  queue: AuthorQueueItem[],
+  completed: string | number,
+): AuthorQueueItem[] {
+  const completedCode = typeof completed === "number" ? formatWorkId(completed) : normalizeWorkCode(completed);
+  if (!completedCode) throw new Error(`无法识别已完成的作品编号：${completed}`);
+  return queue.filter((item) => item.workCode !== completedCode);
+}
+
+export async function writeAuthorDownloadQueue(config: Config, queue: AuthorQueueItem[]): Promise<void> {
+  await ensureDirectory(config.outputDir, "outputDir");
+  await Promise.all([
+    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_QUEUE_FILE_NAME), `${JSON.stringify(queue, null, 2)}\n`),
+    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_LIST_FILE_NAME), buildAuthorDownloadList(queue)),
+  ]);
 }
 
 type AuthorInfo = { name: string; path: string; works: SearchWork[] };
@@ -226,10 +244,9 @@ export async function writeAuthorFindResults(config: Config, report: AuthorFindR
   await ensureDirectory(config.outputDir, "outputDir");
   await Promise.all([
     Bun.write(join(config.outputDir, AUTHOR_FIND_REPORT_FILE_NAME), `${JSON.stringify(report, null, 2)}\n`),
-    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_QUEUE_FILE_NAME), `${JSON.stringify(report.queue, null, 2)}\n`),
-    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_LIST_FILE_NAME), buildAuthorDownloadList(report.queue)),
     Bun.write(join(config.outputDir, AUTHOR_SKIPPED_FILE_NAME), `${JSON.stringify(report.skippedAuthors, null, 2)}\n`),
   ]);
+  await writeAuthorDownloadQueue(config, report.queue);
 }
 
 export async function readAuthorDownloadQueue(config: Config): Promise<AuthorQueueItem[]> {

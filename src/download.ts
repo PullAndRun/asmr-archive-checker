@@ -1,6 +1,10 @@
 import { loadConfig, parseArgs, usage, ensureDirectory, validateOutputDirectory } from "./config.ts";
 import { join } from "node:path";
-import { readAuthorDownloadQueue } from "./author-sync.ts";
+import {
+  readAuthorDownloadQueue,
+  removeAuthorDownloadQueueEntry,
+  writeAuthorDownloadQueue,
+} from "./author-sync.ts";
 import { downloadWorks } from "./downloader.ts";
 import { errorMessage } from "./shared.ts";
 import { AUTHOR_DOWNLOAD_FAILURES_FILE_NAME } from "./constants.ts";
@@ -17,16 +21,30 @@ if (import.meta.main) {
       const queue = await readAuthorDownloadQueue(config);
       // downloadWorks checks the exact destination (downloadDir/author/workCode).
       // Another author's copy must not suppress this author's destination.
-      const pending = queue;
+      let remainingQueue = queue;
       // A failed resource is skipped immediately; the next invocation retries it.
       const downloadConfig = { ...config, maxRetries: 0 };
-      const result = await downloadWorks(pending.map((item) => ({
+      const result = await downloadWorks(remainingQueue.map((item) => ({
         workId: item.workId,
         displayId: item.workCode,
         author: item.author,
-      })), downloadConfig, undefined, { retryFailedWorks: false });
+      })), downloadConfig, undefined, {
+        retryFailedWorks: false,
+        onDownloaded: async (downloaded) => {
+          const nextQueue = removeAuthorDownloadQueueEntry(remainingQueue, downloaded.displayId);
+          if (nextQueue.length === remainingQueue.length) return;
+          await writeAuthorDownloadQueue(config, nextQueue);
+          remainingQueue = nextQueue;
+        },
+      });
+      for (const skipped of result.results.filter((item) => item.status === "skipped")) {
+        const nextQueue = removeAuthorDownloadQueueEntry(remainingQueue, skipped.displayId);
+        if (nextQueue.length === remainingQueue.length) continue;
+        await writeAuthorDownloadQueue(config, nextQueue);
+        remainingQueue = nextQueue;
+      }
       const resultByCode = new Map(result.results.map((item) => [`${item.workId}\0${item.displayId}`, item]));
-      const failures = pending.flatMap((item) => {
+      const failures = queue.flatMap((item) => {
         const outcome = resultByCode.get(`${item.workId}\0${item.workCode}`);
         return outcome && (outcome.status === "failed" || outcome.status === "unavailable")
           ? [{
