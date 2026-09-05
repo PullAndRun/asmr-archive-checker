@@ -14,6 +14,7 @@ import { ensureDirectory, requireDirectory, validateOutputDirectory } from "./co
 import { mapLimit, errorMessage } from "./shared.ts";
 import { logger } from "./logger.ts";
 import { findHttpResponseError } from "./http.ts";
+import { writeFileAtomically } from "./fs-utils.ts";
 import type { Config, SearchWork } from "./types.ts";
 
 export type AuthorQueueItem = {
@@ -64,8 +65,8 @@ export function removeAuthorDownloadQueueEntry(
 export async function writeAuthorDownloadQueue(config: Config, queue: AuthorQueueItem[]): Promise<void> {
   await ensureDirectory(config.outputDir, "outputDir");
   await Promise.all([
-    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_QUEUE_FILE_NAME), `${JSON.stringify(queue, null, 2)}\n`),
-    Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_LIST_FILE_NAME), buildAuthorDownloadList(queue)),
+    writeFileAtomically(join(config.outputDir, AUTHOR_DOWNLOAD_QUEUE_FILE_NAME), `${JSON.stringify(queue, null, 2)}\n`),
+    writeFileAtomically(join(config.outputDir, AUTHOR_DOWNLOAD_LIST_FILE_NAME), buildAuthorDownloadList(queue)),
   ]);
 }
 
@@ -235,21 +236,23 @@ export async function findAuthorDownloads(config: Config): Promise<AuthorFindRep
     missing,
     incomplete,
     queue,
-    skippedAuthors,
-    errors,
+    // Requests complete out of order; keep generated reports deterministic so
+    // repeated runs are easy to diff and review.
+    skippedAuthors: skippedAuthors.toSorted((left, right) => left.author.localeCompare(right.author)),
+    errors: errors.toSorted((left, right) => left.author.localeCompare(right.author) || left.error.localeCompare(right.error)),
   };
 }
 
 export async function writeAuthorFindResults(config: Config, report: AuthorFindReport): Promise<void> {
   await ensureDirectory(config.outputDir, "outputDir");
   await Promise.all([
-    Bun.write(join(config.outputDir, AUTHOR_FIND_REPORT_FILE_NAME), `${JSON.stringify(report, null, 2)}\n`),
-    Bun.write(join(config.outputDir, AUTHOR_SKIPPED_FILE_NAME), `${JSON.stringify(report.skippedAuthors, null, 2)}\n`),
+    writeFileAtomically(join(config.outputDir, AUTHOR_FIND_REPORT_FILE_NAME), `${JSON.stringify(report, null, 2)}\n`),
+    writeFileAtomically(join(config.outputDir, AUTHOR_SKIPPED_FILE_NAME), `${JSON.stringify(report.skippedAuthors, null, 2)}\n`),
   ]);
   await writeAuthorDownloadQueue(config, report.queue);
 }
 
-export async function readAuthorDownloadQueue(config: Config): Promise<AuthorQueueItem[]> {
+export async function readAuthorDownloadQueue(config: Pick<Config, "outputDir">): Promise<AuthorQueueItem[]> {
   const file = Bun.file(join(config.outputDir, AUTHOR_DOWNLOAD_QUEUE_FILE_NAME));
   if (!(await file.exists())) throw new Error(`Missing ${AUTHOR_DOWNLOAD_QUEUE_FILE_NAME}; run find first`);
   const value: unknown = await file.json();
@@ -259,7 +262,7 @@ export async function readAuthorDownloadQueue(config: Config): Promise<AuthorQue
     const record = item as Partial<AuthorQueueItem>;
     const normalizedCode = typeof record.workCode === "string" ? normalizeWorkCode(record.workCode) : undefined;
     const workId = record.workId;
-    if (!record.author?.trim() || !normalizedCode || typeof workId !== "number" || !Number.isSafeInteger(workId) || workId < 1 ||
+    if (typeof record.author !== "string" || !record.author.trim() || !normalizedCode || typeof workId !== "number" || !Number.isSafeInteger(workId) || workId < 1 ||
       (record.reason !== "missing" && record.reason !== "incomplete") || typeof record.source !== "string") {
       throw new Error("Invalid author download queue item");
     }

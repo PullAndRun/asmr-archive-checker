@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { writeFileAtomically } from "../src/fs-utils.ts";
 import {
   buildDownloadFilePlan,
   buildAuthorDownloadList,
@@ -40,6 +41,7 @@ import {
   parseContentRange,
   parseDeletionQueue,
   parseDownloadQueue,
+  readAuthorDownloadQueue,
   removeDownloadQueueEntry,
   removeAuthorDownloadQueueEntry,
   removeMissingWorkEntry,
@@ -549,6 +551,22 @@ describe("文件树和 7z 清单", () => {
 });
 
 describe("命令行参数", () => {
+  test("拒绝字段类型错误的作者下载队列", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-author-queue-validation-test-"));
+    try {
+      await Bun.write(join(root, "author-download-queue.json"), JSON.stringify([{
+        author: 123,
+        workCode: "RJ1",
+        workId: 1,
+        reason: "missing",
+        source: "title",
+      }]));
+      await expect(readAuthorDownloadQueue({ outputDir: root })).rejects.toThrow("Invalid author download queue item");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("支持配置覆盖", () => {
     expect(parseArgs(["--author", "甲", "--dir", "D:/voice", "--asmr-dir", "D:/asmr", "--concurrency", "3"])).toMatchObject({
       author: "甲",
@@ -681,6 +699,19 @@ describe("命令行参数", () => {
 });
 
 describe("配置与结果目录", () => {
+  test("原子写文件不会留下临时文件并能替换旧内容", async () => {
+    const root = await mkdtemp(join(tmpdir(), "asmr-atomic-write-test-"));
+    try {
+      const target = join(root, "result.json");
+      await Bun.write(target, "old");
+      await writeFileAtomically(target, "new\n");
+      expect(await Bun.file(target).text()).toBe("new\n");
+      expect(await readdir(root)).toEqual(["result.json"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("配置路径相对于配置文件解析并拒绝非对象根节点", async () => {
     const root = await mkdtemp(join(tmpdir(), "asmr-archive-config-test-"));
     try {

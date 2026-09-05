@@ -8,6 +8,7 @@ import {
 import { downloadWorks } from "./downloader.ts";
 import { errorMessage } from "./shared.ts";
 import { AUTHOR_DOWNLOAD_FAILURES_FILE_NAME } from "./constants.ts";
+import { writeFileAtomically } from "./fs-utils.ts";
 
 if (import.meta.main) {
   try {
@@ -60,7 +61,7 @@ if (import.meta.main) {
           : [];
       });
       await ensureDirectory(config.outputDir, "outputDir");
-      await Bun.write(join(config.outputDir, AUTHOR_DOWNLOAD_FAILURES_FILE_NAME), `${JSON.stringify(failures, null, 2)}\n`);
+      await writeFileAtomically(join(config.outputDir, AUTHOR_DOWNLOAD_FAILURES_FILE_NAME), `${JSON.stringify(failures, null, 2)}\n`);
       console.log(`download complete: ${result.results.filter((item) => item.status === "downloaded").length} works downloaded`);
       if (result.stoppedByRateLimit && result.remainingCount > 0) {
         console.warn(`media server rate limit reached; ${result.remainingCount} works remain. Wait for the limit window to end before retrying.`);

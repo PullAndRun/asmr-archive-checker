@@ -26,6 +26,7 @@ import { mapLimit } from "./shared.ts";
 import { logger } from "./logger.ts";
 import type { Config } from "./types.ts";
 import { runAuthorFind } from "./author-sync.ts";
+import { writeFileAtomically } from "./fs-utils.ts";
 
 const runDelete = async (config: Config): Promise<void> => {
   await requireDirectory(config.archiveDir, "archiveDir");
@@ -104,8 +105,8 @@ const runDownload = async (config: Config): Promise<void> => {
     }
   }
   if (cleanedAtStart > 0) {
-    const writes = [Bun.write(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), remainingQueueText)];
-    if (remainingMissingText !== undefined) writes.push(Bun.write(join(config.outputDir, MISSING_FILE_NAME), remainingMissingText));
+    const writes = [writeFileAtomically(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), remainingQueueText)];
+    if (remainingMissingText !== undefined) writes.push(writeFileAtomically(join(config.outputDir, MISSING_FILE_NAME), remainingMissingText));
     await Promise.all(writes);
     logger.info(`启动时发现 ${cleanedAtStart} 部已完成作品，已从待下载和遗漏清单移除`);
   }
@@ -121,8 +122,8 @@ const runDownload = async (config: Config): Promise<void> => {
         ? undefined
         : removeMissingWorkEntry(remainingMissingText, result.displayId);
       if (nextQueueText === remainingQueueText && nextMissingText === remainingMissingText) return;
-      const writes = [Bun.write(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), nextQueueText)];
-      if (nextMissingText !== undefined) writes.push(Bun.write(join(config.outputDir, MISSING_FILE_NAME), nextMissingText));
+      const writes = [writeFileAtomically(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), nextQueueText)];
+      if (nextMissingText !== undefined) writes.push(writeFileAtomically(join(config.outputDir, MISSING_FILE_NAME), nextMissingText));
       await Promise.all(writes);
       remainingQueueText = nextQueueText;
       remainingMissingText = nextMissingText;
@@ -136,8 +137,8 @@ const runDownload = async (config: Config): Promise<void> => {
       ? undefined
       : removeMissingWorkEntry(remainingMissingText, result.displayId);
     if (nextQueueText === remainingQueueText && nextMissingText === remainingMissingText) continue;
-    const writes = [Bun.write(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), nextQueueText)];
-    if (nextMissingText !== undefined) writes.push(Bun.write(join(config.outputDir, MISSING_FILE_NAME), nextMissingText));
+    const writes = [writeFileAtomically(join(config.outputDir, DOWNLOAD_QUEUE_FILE_NAME), nextQueueText)];
+    if (nextMissingText !== undefined) writes.push(writeFileAtomically(join(config.outputDir, MISSING_FILE_NAME), nextMissingText));
     await Promise.all(writes);
     remainingQueueText = nextQueueText;
     remainingMissingText = nextMissingText;
